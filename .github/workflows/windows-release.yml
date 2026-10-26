@@ -1,6 +1,12 @@
 name: Signed Windows release
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to publish
+        required: true
+        default: v0.1.0
   push:
     tags: ['v*']
 
@@ -37,6 +43,7 @@ jobs:
           npm ci
           npm test
           npm run build
+          npm install --global @tauri-apps/cli@2.12.4
       - name: Build matching debug core for Tauri resources
         run: cargo build --workspace --locked --target-dir target/reconnect
       - name: Tauri format, clippy and tests
@@ -56,10 +63,10 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
         with:
           projectPath: app
-          tauriScript: npm exec --yes --package @tauri-apps/cli@2.12.4 -- tauri
+          tauriScript: tauri
           args: --config src-tauri/tauri.release.conf.json
-          tagName: ${{ github.ref_name }}
-          releaseName: Paxile ${{ github.ref_name }}
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: Paxile ${{ inputs.tag || github.ref_name }}
           generateReleaseNotes: true
           releaseBody: |
             ## Windows 安装与更新
@@ -83,9 +90,9 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $dir = Join-Path $env:RUNNER_TEMP 'paxile-release-verification'
           New-Item -ItemType Directory -Force $dir | Out-Null
-          gh release download '${{ github.ref_name }}' --dir $dir --pattern 'latest.json' --pattern '*x64-setup.exe' --pattern '*x64-setup.exe.sig'
+          gh release download '${{ inputs.tag || github.ref_name }}' --dir $dir --pattern 'latest.json' --pattern '*x64-setup.exe' --pattern '*x64-setup.exe.sig'
           if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
           $installer = @(Get-ChildItem $dir -Filter '*x64-setup.exe')
           if ($installer.Count -ne 1) { throw 'Expected one x64 NSIS installer' }
-          node scripts/verify-release.cjs (Join-Path $dir 'latest.json') $installer[0].FullName ($installer[0].FullName + '.sig') '${{ github.ref_name }}'
+          node scripts/verify-release.cjs (Join-Path $dir 'latest.json') $installer[0].FullName ($installer[0].FullName + '.sig') '${{ inputs.tag || github.ref_name }}'
           if ($LASTEXITCODE -ne 0) { throw 'Release verification failed' }
