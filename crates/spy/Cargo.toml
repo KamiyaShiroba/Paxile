@@ -1,0 +1,29 @@
+[package]
+name = "paxile-spy"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only message-hook DLL: reports IME/focus/key messages of the hooked thread to paxile-probe"
+
+[lib]
+name = "paxile_spy"
+crate-type = ["cdylib"]
+
+[dependencies]
+paxile-policy = { path = "../policy" }
+serde_json = "1"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_WindowsAndMessaging",
+]

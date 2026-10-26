@@ -1,0 +1,59 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-pc-windows-msvc
+      - name: Frontend tests and build
+        working-directory: app
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm ci
+          npm test
+          npm run build
+      - name: Rust format, clippy, tests and release build
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo fmt --all -- --check
+          cargo build --workspace --locked --target-dir target/reconnect
+          cargo clippy --locked --workspace --all-targets --all-features --target-dir target/reconnect -- -D warnings
+          cargo test --locked --workspace --all-features --target-dir target/reconnect
+          cargo build --workspace --release --locked
+      - name: Tauri format, clippy and tests
+        working-directory: app/src-tauri
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features
+      - name: Tauri release bundle smoke build
+        working-directory: app
+        env:
+          CI: true
+        run: >-
+          npm exec --yes --package @tauri-apps/cli@2.12.4 -- tauri build --ci
+          --bundles nsis --config src-tauri/tauri.release.conf.json
+          --no-sign

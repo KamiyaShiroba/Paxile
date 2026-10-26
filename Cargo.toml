@@ -1,0 +1,6 @@
+[workspace]
+members = ["crates/probe", "crates/spy", "crates/policy"]
+# The Tauri app is its own package (heavy UI deps); keep it out of the engine
+# workspace so `cargo build`/`cargo test` here stay fast and lock-free.
+exclude = ["app"]
+resolver = "2"

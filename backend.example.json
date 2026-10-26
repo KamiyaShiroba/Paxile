@@ -1,0 +1,12 @@
+{
+  "enabled": false,
+  "profile": "auto",
+  "allow_exe": ["Photoshop.exe"],
+  "presets": [
+    {
+      "name": "csp-experimental",
+      "executables": ["CLIPStudioPaint.exe"],
+      "non_text_classes": ["742DEA58-ED6B-4402-BC11-20DFC6D08040*"]
+    }
+  ]
+}

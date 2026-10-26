@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Paxile settings window: IPC to the app's own commands.",
+  "windows": ["settings", "main", "tray-menu"],
+  "permissions": ["core:default"]
+}

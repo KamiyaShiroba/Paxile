@@ -1,0 +1,29 @@
+[package]
+name = "paxile-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only observer of window/focus/caret/IME events for a target process"
+
+[dependencies]
+paxile-policy = { path = "../policy" }
+serde_json = "1"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_SystemInformation",
+]

@@ -1,0 +1,90 @@
+name: Signed Windows release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: ./.github/workflows/windows-ci.yml
+    permissions:
+      contents: read
+  release:
+    needs: validate
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-pc-windows-msvc
+      - name: Install frontend dependencies
+        working-directory: app
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm ci
+          npm test
+          npm run build
+      - name: Build matching debug core for Tauri resources
+        run: cargo build --workspace --locked --target-dir target/reconnect
+      - name: Tauri format, clippy and tests
+        working-directory: app/src-tauri
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-features
+      - name: Build and publish signed NSIS updater
+        id: publish
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        with:
+          projectPath: app
+          tauriScript: npm exec --yes --package @tauri-apps/cli@2.12.4 -- tauri
+          args: --config src-tauri/tauri.release.conf.json --bundles nsis
+          tagName: ${{ github.ref_name }}
+          releaseName: Paxile ${{ github.ref_name }}
+          generateReleaseNotes: true
+          releaseBody: |
+            ## Windows 安装与更新
+            - 下载 `Paxile_*_x64-setup.exe`，按提示为当前用户安装；无需管理员权限。
+            - 默认静默启动，在托盘菜单打开设置；首次使用请先保存作品，并用空白 CSP 文档验证画布快捷键及中文输入。
+            - 设置页检查更新并显示日志，只有确认后才下载、验签和安装。
+            - 更新/卸载仅停止此安装目录的 Paxile 及核心进程，不终止 CSP 或其他应用；仍占用旧 DLL 的应用请自行保存并重启。
+            - Windows「已安装的应用」可以卸载；卸载清理开机启动项，原位更新保留启动设置。
+            - `.sig` 和 `latest.json` 用于更新校验。此为 updater 签名，不是 Windows Authenticode，SmartScreen 可能仍提示未知发布者。
+          releaseDraft: false
+          prerelease: false
+          updaterJsonPreferNsis: true
+          uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+      - name: Verify published manifest and installer signatures
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $dir = Join-Path $env:RUNNER_TEMP 'paxile-release-verification'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          gh release download '${{ github.ref_name }}' --dir $dir --pattern 'latest.json' --pattern '*x64-setup.exe' --pattern '*x64-setup.exe.sig'
+          if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
+          $installer = @(Get-ChildItem $dir -Filter '*x64-setup.exe')
+          if ($installer.Count -ne 1) { throw 'Expected one x64 NSIS installer' }
+          node scripts/verify-release.cjs (Join-Path $dir 'latest.json') $installer[0].FullName ($installer[0].FullName + '.sig') '${{ github.ref_name }}'
+          if ($LASTEXITCODE -ne 0) { throw 'Release verification failed' }

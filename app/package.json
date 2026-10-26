@@ -1,0 +1,9 @@
+{
+  "name": "paxile-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {"dev": "vite --host 127.0.0.1", "build": "vite build", "preview": "vite preview --host 127.0.0.1", "test": "node --test src/tests/*.test.cjs"},
+  "dependencies": {"@tabler/icons-react": "^3.35.0", "react": "^19.2.0", "react-dom": "^19.2.0"},
+  "devDependencies": {"vite": "^7.1.0", "jsdom": "^27.0.0"}
+}
