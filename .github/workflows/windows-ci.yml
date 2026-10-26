@@ -20,9 +20,10 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: app/package-lock.json
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@b725eda528362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: 1.97.1
+          components: rustfmt, clippy
           targets: x86_64-pc-windows-msvc
       - name: Frontend tests and build
         working-directory: app
