@@ -65,9 +65,6 @@ impl Logger {
             rec["t"] = json!((t * 1000.0).round() / 1000.0);
             rec["kind"] = json!(kind);
             let _ = writeln!(f, "{rec}");
-            // Diagnostics must survive an abrupt shutdown, so a trace file is
-            // flushed per record instead of buffering.
-            let _ = f.flush();
         }
     }
 

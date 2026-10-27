@@ -73,14 +73,15 @@ pub fn start(app: &AppHandle) -> Result<Child, String> {
         return Err("缺少 paxile_spy.dll".into());
     }
     let mut command = Command::new(probe);
-    command.args(["watch", "--managed", "--spy", "--block"]);
-    // Opt-in diagnostics: `PAXILE_DEBUG_LOG=1` also writes a JSONL trace next
-    // to the engine's working directory. Normal runs stay memory-only.
-    if std::env::var_os("PAXILE_DEBUG_LOG").is_none() {
-        command.arg("--no-file");
-    }
     command
-        .arg("--config")
+        .args([
+            "watch",
+            "--managed",
+            "--spy",
+            "--block",
+            "--no-file",
+            "--config",
+        ])
         .arg(crate::config::config_path(app)?)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

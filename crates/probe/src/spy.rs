@@ -225,18 +225,7 @@ fn read_conn(
     tx: Sender<String>,
     stop: Arc<AtomicBool>,
     control: crate::control::Shared,
-    sent_policy: Vec<u8>,
-) {
-    read_conn_loop(h, tx, stop, control, sent_policy, || {});
-}
-
-fn read_conn_loop(
-    h: HANDLE,
-    tx: Sender<String>,
-    stop: Arc<AtomicBool>,
-    control: crate::control::Shared,
     mut sent_policy: Vec<u8>,
-    mut after_stop_snapshot: impl FnMut(),
 ) {
     let mut heartbeat_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
     let mut buf = vec![0u8; 64 * 1024];
@@ -244,7 +233,6 @@ fn read_conn_loop(
     let mut awaiting_config: Option<(u64, std::time::Instant)> = None;
     loop {
         let stopped = stop.load(Ordering::Acquire);
-        after_stop_snapshot();
         if awaiting_config
             .as_ref()
             .is_some_and(|(_, at)| at.elapsed().as_secs() >= 2)
@@ -298,8 +286,9 @@ fn read_conn_loop(
             break;
         }
         if available == 0 {
-            // A stop arriving after this iteration's snapshot must go through
-            // the next iteration's stop-frame write, never straight to close.
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
             continue;
         }

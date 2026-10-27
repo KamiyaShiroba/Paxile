@@ -25,6 +25,5 @@ features = [
     "Win32_System_Performance",
     "Win32_System_Threading",
     "Win32_UI_Input_Ime",
-    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ]
