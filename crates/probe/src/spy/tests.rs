@@ -3,6 +3,106 @@ use std::io::Read;
 use std::os::windows::fs::OpenOptionsExt;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 
+// Private pipe instances avoid both the installed controller and DLL worker.
+fn shutdown_connection() -> (std::fs::File, std::thread::JoinHandle<()>) {
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING};
+    let name: Vec<u16> = format!(
+        r"\\.\pipe\paxile-shutdown-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    )
+    .encode_utf16()
+    .chain(Some(0))
+    .collect();
+    let h = unsafe {
+        CreateNamedPipeW(
+            PCWSTR(name.as_ptr()),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
+            1,
+            65536,
+            65536,
+            0,
+            None,
+        )
+    };
+    assert!(!h.is_invalid());
+    let client = unsafe {
+        CreateFileW(
+            PCWSTR(name.as_ptr()),
+            GENERIC_READ.0 | GENERIC_WRITE.0,
+            Default::default(),
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .unwrap();
+    let _ = unsafe { ConnectNamedPipe(h, None) };
+    unsafe {
+        windows::Win32::System::Pipes::SetNamedPipeHandleState(
+            h,
+            Some(&PIPE_READMODE_BYTE),
+            None,
+            None,
+        )
+    }
+    .unwrap();
+    let pipe = unsafe { std::fs::File::from_raw_handle(client.0) };
+    let (tx, _rx) = channel();
+    let control = Arc::new(std::sync::Mutex::new(paxile_policy::BackendControl::new(
+        true,
+    )));
+    let raw = h.0 as usize;
+    let worker = std::thread::spawn(move || {
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = stop.clone();
+        // Exactly reproduce stop arriving after the loop snapshot but before
+        // the empty-input branch. No scheduler-dependent race or sleeps.
+        let policy = serde_json::to_vec(&control.lock().unwrap().policy()).unwrap();
+        read_conn_loop(
+            HANDLE(raw as *mut _),
+            tx,
+            stop,
+            control,
+            policy,
+            move || signal.store(true, Ordering::Release),
+        );
+    });
+    (pipe, worker)
+}
+
+#[test]
+fn shutdown_preserves_stop_for_delayed_reader() {
+    let (mut pipe, worker) = shutdown_connection();
+    // Force the server to finish writing before the client starts reading.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let mut frame = [255; 9];
+    pipe.read_exact(&mut frame).expect("initial lease");
+    assert_eq!(frame[0], 1);
+    pipe.read_exact(&mut frame)
+        .expect("stop frame must survive delayed read");
+    assert_eq!(frame[0], 0);
+    worker.join().unwrap();
+}
+
+#[test]
+fn shutdown_is_bounded_when_client_never_reads() {
+    let (_pipe, worker) = shutdown_connection();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !worker.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        worker.is_finished(),
+        "nonreading client must not block shutdown"
+    );
+    worker.join().unwrap();
+}
+
 #[test]
 fn duplex_pipe_transports_config_lease_and_stop() {
     let (tx, rx) = channel();
