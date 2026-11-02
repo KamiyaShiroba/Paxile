@@ -3,6 +3,38 @@ use serde::{Deserialize, Serialize};
 
 pub const CSP_CLASS: &str = "742DEA58-ED6B-4402-BC11-20DFC6D08040";
 
+/// Case-insensitive whole-string match where `*` in `pattern` matches any run
+/// (possibly empty) of characters. No other character is special, so a concrete
+/// name like "CLIPStudioPaint.exe" still matches exactly, while
+/// "CLIPStudioPaint*.exe" also matches patched variants such as
+/// "CLIPStudioPaint_Patched.exe".
+pub fn exe_matches(pattern: &str, exe: &str) -> bool {
+    let (pat, text) = (pattern.as_bytes(), exe.as_bytes());
+    // Iterative two-pointer wildcard match that backtracks on the last '*'.
+    let (mut p, mut t) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while t < text.len() {
+        if p < pat.len() && pat[p] == b'*' {
+            star = p;
+            mark = t;
+            p += 1;
+        } else if p < pat.len() && pat[p].eq_ignore_ascii_case(&text[t]) {
+            p += 1;
+            t += 1;
+        } else if star != usize::MAX {
+            p = star + 1;
+            mark += 1;
+            t = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
 /// Runtime intent, independent of hook transport and UI-thread application.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlCommand {
@@ -98,7 +130,7 @@ impl Default for Config {
             allow_exe: vec![],
             presets: vec![Preset {
                 name: "csp-experimental".into(),
-                executables: vec!["CLIPStudioPaint.exe".into()],
+                executables: vec!["CLIPStudioPaint*.exe".into()],
                 non_text_classes: vec![format!("{CSP_CLASS}*")],
             }],
         }
@@ -111,6 +143,14 @@ pub struct Preset {
     pub executables: Vec<String>,
     /// Exact class or prefix followed by '*'. Only use with an app adapter.
     pub non_text_classes: Vec<String>,
+}
+impl Preset {
+    /// A process name matches this preset when any executable pattern matches it.
+    pub fn matches_exe(&self, exe: &str) -> bool {
+        self.executables
+            .iter()
+            .any(|pattern| exe_matches(pattern, exe))
+    }
 }
 #[derive(Default, Debug)]
 pub struct Observation {
@@ -134,6 +174,7 @@ impl Config {
                 return Err("preset names must be unique, nonempty, and not auto".into());
             }
             if p.executables.is_empty()
+                || p.executables.iter().any(|e| e.is_empty() || e == "*")
                 || p.non_text_classes.iter().any(|c| c.is_empty() || c == "*")
             {
                 return Err("presets require executables and specific class patterns".into());
@@ -154,7 +195,7 @@ impl Config {
         }
         for p in &self.presets {
             if (self.profile == "auto" || self.profile == p.name)
-                && p.executables.iter().any(|e| e.eq_ignore_ascii_case(exe))
+                && p.matches_exe(exe)
                 && p.non_text_classes.iter().any(|c| {
                     c.strip_suffix('*')
                         .map_or(o.class == *c, |prefix| o.class.starts_with(prefix))
@@ -239,6 +280,47 @@ mod tests {
     }
 
     #[test]
+    fn default_preset_matches_patched_variants_but_not_unrelated_apps() {
+        let mut c = Config {
+            enabled: true,
+            ..Default::default()
+        };
+        let o = Observation {
+            class: CSP_CLASS.into(),
+            ..Default::default()
+        };
+        assert_eq!(c.decide("CLIPStudioPaint.exe", &o), Decision::Block);
+        assert_eq!(c.decide("CLIPStudioPaint_Patched.exe", &o), Decision::Block);
+        assert_eq!(c.decide("clipstudiopaint_x64.EXE", &o), Decision::Block);
+        // Unrelated executables never match, even inside CSP's class.
+        assert_eq!(c.decide("Photoshop.exe", &o), Decision::Allow);
+        assert_eq!(c.decide("NotCLIPStudioPaint.exe", &o), Decision::Allow);
+        // The whitelist still wins by concrete name over the glob preset.
+        c.allow_exe.push("CLIPStudioPaint_Patched.exe".into());
+        assert_eq!(c.decide("CLIPStudioPaint_Patched.exe", &o), Decision::Allow);
+    }
+
+    #[test]
+    fn exe_glob_anchors_and_is_case_insensitive() {
+        assert!(exe_matches("CLIPStudioPaint*.exe", "CLIPStudioPaint.exe"));
+        assert!(exe_matches(
+            "CLIPStudioPaint*.exe",
+            "clipstudiopaint_patched.EXE"
+        ));
+        assert!(exe_matches("a*b*c", "aXXbYYc"));
+        assert!(exe_matches("*.exe", "anything.exe"));
+        assert!(!exe_matches(
+            "CLIPStudioPaint*.exe",
+            "CLIPStudioPaint.exe.bak"
+        ));
+        assert!(!exe_matches(
+            "CLIPStudioPaint*.exe",
+            "MyCLIPStudioPaint.exe"
+        ));
+        assert!(!exe_matches("abc", "ab"));
+    }
+
+    #[test]
     fn text_signals_and_unknown_software_fail_open() {
         let c = Config {
             enabled: true,
@@ -302,5 +384,10 @@ mod tests {
         c.profile = "auto".into();
         c.presets[0].non_text_classes = vec!["*".into()];
         assert!(c.validate().is_err());
+        let mut wild = Config::default();
+        wild.presets[0].executables = vec!["*".into()];
+        assert!(wild.validate().is_err());
+        wild.presets[0].executables = vec![String::new()];
+        assert!(wild.validate().is_err());
     }
 }

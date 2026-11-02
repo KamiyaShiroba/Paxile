@@ -109,6 +109,22 @@ mod tests {
         );
     }
     #[test]
+    fn onboarding_defaults_unseen_and_old_files_show_the_tour_once() {
+        assert!(!AppPreferences::default().onboarding_seen);
+        // A preference file written before this field existed must not suppress
+        // the tour, while an explicit true is preserved.
+        assert!(
+            !serde_json::from_str::<AppPreferences>(r#"{"silent_start":false}"#)
+                .unwrap()
+                .onboarding_seen
+        );
+        assert!(
+            serde_json::from_str::<AppPreferences>(r#"{"onboarding_seen":true}"#)
+                .unwrap()
+                .onboarding_seen
+        );
+    }
+    #[test]
     fn staging_failure_preserves_existing_file_and_success_replaces_it() {
         let directory =
             std::env::temp_dir().join(format!("paxile-config-test-{}", std::process::id()));
@@ -137,11 +153,17 @@ mod tests {
 #[serde(default)]
 pub struct AppPreferences {
     pub silent_start: bool,
+    /// Whether the first-run guidance has been dismissed. Missing in older
+    /// preference files, so it defaults to false and the tour shows once.
+    pub onboarding_seen: bool,
 }
 
 impl Default for AppPreferences {
     fn default() -> Self {
-        Self { silent_start: true }
+        Self {
+            silent_start: true,
+            onboarding_seen: false,
+        }
     }
 }
 

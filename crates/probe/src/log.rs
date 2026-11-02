@@ -35,8 +35,21 @@ impl Logger {
     pub fn new(prefix: &str, to_file: bool) -> io::Result<Self> {
         let (file, path) = if to_file {
             fs::create_dir_all("logs")?;
-            let p = PathBuf::from("logs").join(format!("{prefix}-{}.jsonl", stamp()));
-            (Some(BufWriter::new(File::create(&p)?)), Some(p))
+            let (f, p) = (0u64..)
+                .find_map(|n| {
+                    let p = PathBuf::from("logs").join(format!(
+                        "{prefix}-{}-{}-{n}.jsonl",
+                        stamp(),
+                        std::process::id()
+                    ));
+                    match File::options().write(true).create_new(true).open(&p) {
+                        Ok(f) => Some(Ok((f, p))),
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => None,
+                        Err(e) => Some(Err(e)),
+                    }
+                })
+                .expect("unbounded filename iterator")?;
+            (Some(BufWriter::new(f)), Some(p))
         } else {
             (None, None)
         };
@@ -64,7 +77,9 @@ impl Logger {
         if let Some(f) = self.file.as_mut() {
             rec["t"] = json!((t * 1000.0).round() / 1000.0);
             rec["kind"] = json!(kind);
-            let _ = writeln!(f, "{rec}");
+            if let Err(e) = writeln!(f, "{rec}").and_then(|_| f.flush()) {
+                eprintln!("paxile-probe: diagnostic write/flush failed: {e}");
+            }
         }
     }
 
@@ -72,10 +87,39 @@ impl Logger {
     pub fn note(&self, s: &str) {
         println!("{s}");
     }
-
     pub fn flush(&mut self) {
         if let Some(f) = self.file.as_mut() {
-            let _ = f.flush();
+            if let Err(e) = f.flush() {
+                eprintln!("paxile-probe: diagnostic flush failed: {e}");
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_record_is_visible_before_logger_drop_and_names_are_unique() {
+        let mut first = Logger::new("probe-regression", true).unwrap();
+        let second = Logger::new("probe-regression", true).unwrap();
+        assert_ne!(first.path, second.path);
+        assert!(first
+            .path
+            .as_ref()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&format!("-{}-", std::process::id())));
+        first.emit_at(123, "backend", "safe", json!({"qpc":123}));
+        let text = fs::read_to_string(first.path.as_ref().unwrap()).unwrap();
+        let record: Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(record["qpc"], 123);
+        let second_path = second.path.clone().unwrap();
+        drop(second);
+        fs::remove_file(second_path).unwrap();
+        let path = first.path.clone().unwrap();
+        drop(first);
+        fs::remove_file(path).unwrap();
     }
 }

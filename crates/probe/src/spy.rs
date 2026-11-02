@@ -1,5 +1,5 @@
 //! Probe side of paxile-spy: a named-pipe server that receives the DLL's
-//! JSON lines, and per-thread installation of its two message hooks.
+//! JSON lines, and per-thread installation of its three message hooks.
 #[cfg(test)]
 mod tests;
 
@@ -19,7 +19,8 @@ use windows::Win32::System::Pipes::{
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, HOOKPROC, WH_CALLWNDPROC, WH_GETMESSAGE,
+    SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, HOOKPROC, WH_CALLWNDPROC, WH_CALLWNDPROCRET,
+    WH_GETMESSAGE,
 };
 
 pub struct Spy {
@@ -27,6 +28,7 @@ pub struct Spy {
     hmod: HMODULE,
     getmsg: HOOKPROC,
     callwnd: HOOKPROC,
+    callwndret: HOOKPROC,
     hooks: HashMap<u32, Vec<HHOOK>>,
     rx: Receiver<String>,
     stop: Arc<AtomicBool>,
@@ -55,6 +57,8 @@ impl Spy {
                 .ok_or("missing paxile_getmsg_proc")?;
             let callwnd = GetProcAddress(hmod, s!("paxile_callwnd_proc"))
                 .ok_or("missing paxile_callwnd_proc")?;
+            let callwndret = GetProcAddress(hmod, s!("paxile_callwndret_proc"))
+                .ok_or("missing paxile_callwndret_proc")?;
             let (tx, rx) = channel();
             let stop = Arc::new(AtomicBool::new(false));
             let server_stop = stop.clone();
@@ -67,6 +71,9 @@ impl Spy {
                 ),
                 callwnd: std::mem::transmute::<unsafe extern "system" fn() -> isize, HOOKPROC>(
                     callwnd,
+                ),
+                callwndret: std::mem::transmute::<unsafe extern "system" fn() -> isize, HOOKPROC>(
+                    callwndret,
                 ),
                 hooks: HashMap::new(),
                 rx,
@@ -85,7 +92,11 @@ impl Spy {
             let inst = HINSTANCE(self.hmod.0);
             let mut hs = Vec::new();
             let mut err = None;
-            for (id, proc_) in [(WH_GETMESSAGE, self.getmsg), (WH_CALLWNDPROC, self.callwnd)] {
+            for (id, proc_) in [
+                (WH_GETMESSAGE, self.getmsg),
+                (WH_CALLWNDPROC, self.callwnd),
+                (WH_CALLWNDPROCRET, self.callwndret),
+            ] {
                 match unsafe { SetWindowsHookExW(id, proc_, inst, tid) } {
                     Ok(h) => hs.push(h),
                     Err(e) => err = Some(e.to_string()),
@@ -190,7 +201,7 @@ fn serve(
                 *id == pid
                     && current_policy.presets.iter().any(|p| {
                         (current_policy.profile == "auto" || current_policy.profile == p.name)
-                            && p.executables.iter().any(|e| e.eq_ignore_ascii_case(exe))
+                            && p.matches_exe(exe)
                     })
             });
         if !allowed {

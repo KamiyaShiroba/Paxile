@@ -5,14 +5,17 @@
 //!    lives in other processes;
 //!  - a timer that polls GetGUIThreadInfo + IME open/conversion state of the
 //!    foreground thread and logs only what changed;
-//!  - a low-level keyboard hook, always passing keys on untouched: ScrollLock
+//!  - with --keys, a low-level keyboard hook passing keys on untouched: ScrollLock
 //!    / Pause drop a MARK, and with --keys every key is logged while the
 //!    target is in the foreground;
 //!  - with --spy, the paxile-spy DLL's in-process message records.
 //!
 //! Lines typed into this console are also logged as MARKs.
 
-use std::cell::RefCell;
+#[path = "accessibility.rs"]
+mod accessibility;
+
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver};
@@ -35,15 +38,258 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::events::{self, event_name, objid_name, EVENT_OBJECT_DESTROY, OBJID_WINDOW};
 use crate::log::Logger;
 use crate::spy::Spy;
-use crate::win::{
-    describe_cached, gui_tids, hx, pids_by_exe, processes, raw, short_class, thread_pid, WinDesc,
-};
+use crate::win::{describe_cached, gui_tids, hx, pids_by_exe, processes, raw, thread_pid, WinDesc};
 
 const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
 const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
 const WM_IME_CONTROL: u32 = 0x0283;
 const IMC_GETCONVERSIONMODE: usize = 0x0001;
 const IMC_GETOPENSTATUS: usize = 0x0005;
+
+#[derive(Default)]
+struct TargetHooks<H> {
+    entries: BTreeMap<(u32, usize), H>,
+}
+
+impl<H> TargetHooks<H> {
+    fn sync<R: Copy>(
+        &mut self,
+        pids: &[u32],
+        ranges: &[R],
+        mut install: impl FnMut(u32, R) -> Option<H>,
+        mut remove: impl FnMut(H),
+    ) {
+        let stale: Vec<_> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|(pid, _)| !pids.contains(pid))
+            .collect();
+        for key in stale {
+            if let Some(hook) = self.entries.remove(&key) {
+                remove(hook);
+            }
+        }
+        for &pid in pids {
+            for (index, &range) in ranges.iter().enumerate() {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    self.entries.entry((pid, index))
+                {
+                    if let Some(hook) = install(pid, range) {
+                        entry.insert(hook);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn sync_target_hooks(hooks: &mut TargetHooks<HWINEVENTHOOK>, pids: &[u32], all: bool) {
+    hooks.sync(
+        pids,
+        &events::target_ranges(all),
+        |pid, (lo, hi)| {
+            let hook = unsafe {
+                SetWinEventHook(
+                    lo,
+                    hi,
+                    HMODULE::default(),
+                    Some(on_target_event),
+                    pid,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                )
+            };
+            if hook.0.is_null() {
+                eprintln!("paxile-probe: WinEvent hook failed pid={pid} range={lo:#x}..{hi:#x}");
+                None
+            } else {
+                Some(hook)
+            }
+        },
+        |hook| {
+            if !unsafe { UnhookWinEvent(hook) }.as_bool() {
+                eprintln!("paxile-probe: UnhookWinEvent failed");
+            }
+        },
+    );
+}
+
+/// Sanitize before constructing either sink, including records from old DLLs.
+fn redact_input(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let char_message = map.get("msg").and_then(Value::as_str).is_some_and(|s| {
+                matches!(
+                    s,
+                    "WM_CHAR"
+                        | "WM_SYSCHAR"
+                        | "WM_DEADCHAR"
+                        | "WM_SYSDEADCHAR"
+                        | "WM_UNICHAR"
+                        | "WM_IME_CHAR"
+                        | "WM_IME_COMPOSITION"
+                )
+            });
+            map.retain(|key, _| {
+                !matches!(
+                    key.to_ascii_lowercase().as_str(),
+                    "ch" | "char"
+                        | "text"
+                        | "comp"
+                        | "result"
+                        | "title"
+                        | "composition"
+                        | "window_title"
+                ) && !(char_message
+                    && matches!(
+                        key.as_str(),
+                        "wp" | "wparam" | "lp" | "lparam" | "vk" | "vk_orig"
+                    ))
+            });
+            for v in map.values_mut() {
+                redact_input(v);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                redact_input(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn log_spy_line(log: &mut Logger, line: &str) -> bool {
+    let Ok(mut record) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    if !record.is_object() {
+        return false;
+    }
+    redact_input(&mut record);
+    let received = crate::log::qpc();
+    let producer = record.get("qpc").and_then(Value::as_i64).filter(|q| *q > 0);
+    if producer.is_none() {
+        record.as_object_mut().unwrap().remove("qpc");
+    }
+    record["received_qpc"] = json!(received);
+    record["time_basis"] = json!(if producer.is_some() {
+        "producer_qpc"
+    } else {
+        "received_qpc"
+    });
+    let kind = if record.get("backend").is_some() {
+        "backend"
+    } else if record.get("hello").is_some()
+        || record.get("disconnected").is_some()
+        || record.get("pipe_error").is_some()
+    {
+        "info"
+    } else {
+        "spy"
+    };
+    let human = format!("SPY {record}");
+    log.emit_at(producer.unwrap_or(received), kind, &human, record);
+    true
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_stdout_is_redacted() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "watch::diagnostic_tests::backend_and_hello_use_production_time_and_redact_legacy_payloads", "--nocapture"])
+            .output().unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!stdout.contains("PRIVATE"));
+        assert!(stdout.contains("producer_qpc"));
+        assert!(stdout.contains("received_qpc"));
+    }
+
+    #[test]
+    fn reentrant_delivery_is_counted_without_panicking() {
+        REENTRANT_DROPS.with(|n| n.set(0));
+        CTX.with(|c| {
+            let _guard = c.borrow_mut();
+            with_ctx(|_| panic!("reentrant callback must be dropped"));
+        });
+        assert_eq!(REENTRANT_DROPS.with(Cell::get), 1);
+    }
+
+    #[test]
+    fn managed_hooks_add_retry_remove_and_release() {
+        let mut hooks = TargetHooks::<u32>::default();
+        let mut removed = Vec::new();
+        hooks.sync(
+            &[10],
+            &[1, 2],
+            |pid, range| (range == 1).then_some(pid + range),
+            |h| removed.push(h),
+        );
+        assert_eq!(hooks.entries.len(), 1);
+        hooks.sync(
+            &[10, 20],
+            &[1, 2],
+            |pid, range| Some(pid + range),
+            |h| removed.push(h),
+        );
+        assert_eq!(hooks.entries.len(), 4);
+        hooks.sync(
+            &[20],
+            &[1, 2],
+            |_, _| panic!("duplicate install"),
+            |h| removed.push(h),
+        );
+        assert_eq!(hooks.entries.len(), 2);
+        removed.sort();
+        assert_eq!(removed, vec![11, 12]);
+        hooks.sync(
+            &[],
+            &[1, 2],
+            |_, _| panic!("shutdown install"),
+            |h| removed.push(h),
+        );
+        assert!(hooks.entries.is_empty());
+        removed.sort();
+        assert_eq!(removed, vec![11, 12, 21, 22]);
+    }
+
+    #[test]
+    fn backend_and_hello_use_production_time_and_redact_legacy_payloads() {
+        let mut log = Logger::new("probe-timeline-test", true).unwrap();
+        for discriminator in ["backend", "hello"] {
+            let line = json!({discriminator:true,"qpc":123,"ch":"PRIVATE",
+                "comp":"PRIVATE","result":"PRIVATE","title":"PRIVATE",
+                "msg":"WM_CHAR","wp":31169,"lp":99,"nested":{"title":"PRIVATE"}})
+            .to_string();
+            assert!(log_spy_line(&mut log, &line));
+        }
+        assert!(log_spy_line(&mut log, r#"{"backend":"legacy"}"#));
+        assert!(!log_spy_line(&mut log, "not json PRIVATE"));
+        let path = log.path.clone().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("PRIVATE"));
+        let records: Vec<Value> = text
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        for r in &records[..2] {
+            assert_eq!(r["qpc"], 123);
+            assert_eq!(r["time_basis"], "producer_qpc");
+            assert!(r["received_qpc"].as_i64().unwrap() > 123);
+            assert!(r.get("wp").is_none());
+            assert!(r.get("lp").is_none());
+        }
+        assert_eq!(records[2]["time_basis"], "received_qpc");
+        assert!(records[2].get("qpc").is_none());
+        drop(log);
+        std::fs::remove_file(path).unwrap();
+    }
+}
 
 pub struct Opts {
     pub exe: String,
@@ -64,6 +310,7 @@ static MAIN_TID: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
     static CTX: RefCell<Option<Ctx>> = const { RefCell::new(None) };
+    static REENTRANT_DROPS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Runs `f` against the context unless it's already borrowed (re-entrant
@@ -74,6 +321,8 @@ fn with_ctx(f: impl FnOnce(&mut Ctx)) {
             if let Some(ctx) = g.as_mut() {
                 f(ctx)
             }
+        } else {
+            REENTRANT_DROPS.with(|n| n.set(n.get().saturating_add(1)));
         }
     })
 }
@@ -143,8 +392,10 @@ struct Ctx {
     marks: u32,
     mark_rx: Receiver<String>,
     spy: Option<Spy>,
+    accessibility: Option<accessibility::Probe>,
     control: crate::control::Shared,
     managed: bool,
+    target_hooks: TargetHooks<HWINEVENTHOOK>,
 }
 
 impl Ctx {
@@ -337,67 +588,9 @@ impl Ctx {
     }
 
     fn on_spy_line(&mut self, line: &str) {
-        let Ok(r) = serde_json::from_str::<Value>(line) else {
-            return;
-        };
-        if r.get("backend").is_some() {
-            self.log.emit("backend", &format!("IME BACKEND {line}"), r);
-            return;
+        if !log_spy_line(&mut self.log, line) {
+            *self.counts.entry("spy_parse_failed").or_default() += 1;
         }
-        if r.get("hello").is_some() {
-            self.log.emit(
-                "info",
-                &format!("spy connected: pid {} tid {}", r["pid"], r["tid"]),
-                r,
-            );
-            return;
-        }
-        if r.get("disconnected").is_some() || r.get("pipe_error").is_some() {
-            self.log.emit("info", &format!("spy: {line}"), r);
-            return;
-        }
-        let q = r["qpc"].as_i64().unwrap_or_else(crate::log::qpc);
-        let name = r["msg"].as_str().unwrap_or("?");
-        let mut human = format!(
-            "SPY {} {:<23} {} {:?}",
-            r["src"].as_str().unwrap_or(""),
-            name,
-            r["hwnd"].as_str().unwrap_or(""),
-            short_class(r["class"].as_str().unwrap_or(""))
-        );
-        if let Some(s) = r["sub"].as_str() {
-            human += &format!(" {s}");
-        }
-        if let Some(vk) = r["vk"].as_u64() {
-            human += &format!(" {}", vk_name(vk as u32));
-            if let Some(o) = r["vk_orig"].as_u64() {
-                human += &format!(" (was {})", vk_name(o as u32));
-            }
-        }
-        if let Some(c) = r["ch"].as_str() {
-            human += &format!(" ch={c:?}");
-        }
-        if let Some(c) = r["comp"].as_str() {
-            human += &format!(" comp={c:?}");
-        }
-        if let Some(c) = r["result"].as_str() {
-            human += &format!(" result={c:?}");
-        }
-        if name == "WM_IME_SETCONTEXT" {
-            human += &format!(" active={}", r["wp"]);
-        }
-        match r["himc"].as_bool() {
-            Some(true) => {
-                human += &format!(
-                    "  [imc open={} conv={}]",
-                    r["open"],
-                    conv_str(r["conv"].as_u64().map(|c| c as usize))
-                )
-            }
-            Some(false) => human += "  [no imc]",
-            None => {}
-        }
-        self.log.emit_at(q, "spy", &human, r);
     }
 
     fn on_key(&mut self, msg: u32, k: &KBDLLHOOKSTRUCT) {
@@ -613,6 +806,16 @@ fn tick() {
         for l in lines {
             c.on_spy_line(&l);
         }
+        if let Some(probe) = &c.accessibility {
+            for mut record in probe.drain() {
+                let qpc = record["qpc"].as_i64().unwrap_or_else(crate::log::qpc);
+                record["received_qpc"] = json!(crate::log::qpc());
+                record["time_basis"] = json!("producer_qpc");
+                record["producer_drops"] = json!(probe.dropped());
+                c.log
+                    .emit_at(qpc, "accessibility", &format!("UIA {record}"), record);
+            }
+        }
         // Every ~2s: flush, hook new UI threads, notice if the target went away.
         if c.managed && c.ticks % 20 == 0 {
             let policy = c.control.lock().unwrap().policy();
@@ -620,12 +823,15 @@ fn tick() {
                 .into_iter()
                 .filter(|(_, exe)| {
                     policy.presets.iter().any(|p| {
-                        (policy.profile == "auto" || policy.profile == p.name)
-                            && p.executables.iter().any(|e| e.eq_ignore_ascii_case(exe))
+                        (policy.profile == "auto" || policy.profile == p.name) && p.matches_exe(exe)
                     })
                 })
                 .map(|(pid, _)| pid)
                 .collect();
+            sync_target_hooks(&mut c.target_hooks, &c.pids, c.all);
+            if let Some(probe) = &mut c.accessibility {
+                probe.set_targets(&c.pids);
+            }
             c.hook_new_threads();
         }
         if c.ticks % 40 == 0 {
@@ -662,22 +868,10 @@ pub fn run(opts: Opts, pids: Vec<u32>, log: Logger) {
         pids
     };
 
-    let mut hooks: Vec<HWINEVENTHOOK> = Vec::new();
-    unsafe {
-        for &pid in &pids {
-            for (lo, hi) in events::target_ranges(opts.all) {
-                hooks.push(SetWinEventHook(
-                    lo,
-                    hi,
-                    HMODULE::default(),
-                    Some(on_target_event),
-                    pid,
-                    0,
-                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-                ));
-            }
-        }
-        hooks.push(SetWinEventHook(
+    let mut hooks = TargetHooks::default();
+    sync_target_hooks(&mut hooks, &pids, opts.all);
+    let global_hook = unsafe {
+        SetWinEventHook(
             events::EVENT_OBJECT_IME_SHOW,
             events::EVENT_OBJECT_TEXTEDIT_CONVERSIONTARGETCHANGED,
             HMODULE::default(),
@@ -685,14 +879,18 @@ pub fn run(opts: Opts, pids: Vec<u32>, log: Logger) {
             0,
             0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        ));
-    }
-    let failed = hooks.iter().filter(|h| h.0.is_null()).count();
-
-    // Installed even without --keys: it's how ScrollLock/Pause marks arrive.
-    let kb_hook = unsafe {
-        let hmod = GetModuleHandleW(None).unwrap_or_default();
-        SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), HINSTANCE(hmod.0), 0).ok()
+        )
+    };
+    let failed = events::target_ranges(opts.all).len() * pids.len() - hooks.entries.len()
+        + usize::from(global_hook.0.is_null());
+    // Low-level key sampling is explicit opt-in only.
+    let kb_hook = if opts.keys {
+        unsafe {
+            let hmod = GetModuleHandleW(None).unwrap_or_default();
+            SetWindowsHookExW(WH_KEYBOARD_LL, Some(on_key), HINSTANCE(hmod.0), 0).ok()
+        }
+    } else {
+        None
     };
 
     let mut log = log;
@@ -700,15 +898,15 @@ pub fn run(opts: Opts, pids: Vec<u32>, log: Logger) {
         "info",
         &format!(
             "watching {} pid {:?}: {} winevent hooks ({} failed), keys={}, spy={}, poll={}ms, all={}",
-            opts.exe, pids, hooks.len(), failed, opts.keys, opts.spy, opts.poll_ms, opts.all
+            opts.exe, pids, hooks.entries.len() + 1, failed, opts.keys, opts.spy, opts.poll_ms, opts.all
         ),
-        json!({ "exe": opts.exe, "pids": pids, "hooks": hooks.len(), "failed": failed,
+        json!({ "exe": opts.exe, "pids": pids, "hooks": hooks.entries.len() + 1, "failed": failed,
                 "keys": opts.keys, "spy": opts.spy, "poll_ms": opts.poll_ms, "all": opts.all }),
     );
     if let Some(p) = &log.path {
         log.note(&format!("jsonl -> {}", p.display()));
     }
-    log.note("MARK: press ScrollLock / Pause, or type a note here + Enter");
+    log.note("MARK: type a note + Enter; --keys also enables ScrollLock/Pause marks and records virtual keys/scan codes");
 
     let control = std::sync::Arc::new(std::sync::Mutex::new(paxile_policy::BackendControl::new(
         opts.authorized,
@@ -758,6 +956,24 @@ pub fn run(opts: Opts, pids: Vec<u32>, log: Logger) {
         None
     };
 
+    let accessibility = match accessibility::Probe::start(pids.clone()) {
+        Ok(probe) => probe,
+        Err(_) => {
+            log.emit(
+                "info",
+                "UIA diagnostic worker unavailable",
+                json!({"uia":"worker_start_failed"}),
+            );
+            None
+        }
+    };
+    if accessibility.is_some() {
+        log.emit(
+            "info",
+            "UIA structural diagnostics explicitly enabled (provider calls have no hard deadline)",
+            json!({"uia":"enabled", "poll_ms":200}),
+        );
+    }
     let (mark_tx, mark_rx) = channel();
     let managed = opts.managed;
     std::thread::spawn(move || {
@@ -793,8 +1009,10 @@ pub fn run(opts: Opts, pids: Vec<u32>, log: Logger) {
             marks: 0,
             mark_rx,
             spy,
+            accessibility,
             control,
             managed: opts.managed,
+            target_hooks: hooks,
         })
     });
     with_ctx(|c| c.hook_new_threads());
@@ -812,18 +1030,24 @@ pub fn run(opts: Opts, pids: Vec<u32>, log: Logger) {
             DispatchMessageW(&msg);
         }
         let _ = KillTimer(HWND::default(), timer);
-        for h in hooks {
-            let _ = UnhookWinEvent(h);
-        }
+        let _ = UnhookWinEvent(global_hook);
         if let Some(h) = kb_hook {
             let _ = UnhookWindowsHookEx(h);
         }
     }
 
     if let Some(mut c) = CTX.with(|c| c.borrow_mut().take()) {
+        sync_target_hooks(&mut c.target_hooks, &[], c.all);
         if let Some(s) = c.spy.as_mut() {
             s.unhook_all();
         }
+        let uia_drops = c.accessibility.as_ref().map(|p| p.dropped()).unwrap_or(0);
+        drop(c.accessibility.take());
+        c.log.emit(
+            "info",
+            "UIA diagnostic producer loss",
+            json!({"uia":"summary", "producer_drops":uia_drops}),
+        );
         c.log.note("== event counts:");
         for (k, v) in &c.counts {
             c.log.note(&format!("   {v:>6} {k}"));
@@ -832,7 +1056,7 @@ pub fn run(opts: Opts, pids: Vec<u32>, log: Logger) {
         for (k, v) in &c.classes {
             c.log.note(&format!("   {v:>6} {k:?}"));
         }
-        let rec = json!({ "counts": c.counts, "classes": c.classes });
+        let rec = json!({ "counts": c.counts, "classes": c.classes, "reentrant_drops": REENTRANT_DROPS.with(Cell::get) });
         c.log.emit("summary", "done", rec);
         c.log.flush();
     }

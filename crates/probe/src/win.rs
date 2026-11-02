@@ -11,8 +11,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetDesktopWindow, GetWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, InternalGetWindowText, IsWindow,
-    IsWindowVisible, GA_PARENT, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    GA_PARENT, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
 };
 
 /// CSP's window classes are all "<app GUID>[-<kind GUID>]"; keep only the
@@ -88,6 +88,7 @@ const EXSTYLE_FLAGS: &[(u32, &str)] = &[
 pub struct WinDesc {
     pub hwnd: usize,
     pub class: String,
+    #[cfg(test)]
     pub title: String,
     pub pid: u32,
     pub tid: u32,
@@ -120,9 +121,7 @@ impl WinDesc {
 
     pub fn short(&self) -> String {
         let mut s = format!("{} {:?}", hx(self.hwnd), short_class(&self.class));
-        if !self.title.is_empty() {
-            s += &format!(" {:?}", self.title);
-        }
+
         if !self.alive {
             s += " (dead)";
         }
@@ -155,7 +154,6 @@ impl WinDesc {
         json!({
             "hwnd": hx(self.hwnd),
             "class": self.class,
-            "title": self.title,
             "pid": self.pid,
             "tid": self.tid,
             "visible": self.visible,
@@ -175,8 +173,7 @@ pub fn describe(h: HWND) -> WinDesc {
     unsafe {
         let mut cb = [0u16; 256];
         let n = GetClassNameW(h, &mut cb);
-        let mut tb = [0u16; 512];
-        let tn = InternalGetWindowText(h, &mut tb);
+
         let (tid, pid) = thread_pid(h);
         let mut r = RECT::default();
         let _ = GetWindowRect(h, &mut r);
@@ -189,7 +186,8 @@ pub fn describe(h: HWND) -> WinDesc {
         WinDesc {
             hwnd: raw(h),
             class: wstr(&cb, n),
-            title: wstr(&tb, tn),
+            #[cfg(test)]
+            title: String::new(),
             pid,
             tid,
             visible: IsWindowVisible(h).as_bool(),
@@ -277,4 +275,31 @@ pub fn pids_by_exe(exe: &str) -> Vec<u32> {
         .filter(|(_, n)| n.eq_ignore_ascii_case(exe))
         .map(|(p, _)| p)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn window_outputs_never_contain_title() {
+        let d = WinDesc {
+            hwnd: 1,
+            class: "Edit".into(),
+            title: "PRIVATE TITLE".into(),
+            pid: 1,
+            tid: 1,
+            visible: true,
+            style: 0,
+            exstyle: 0,
+            parent: 0,
+            owner: 0,
+            root: 1,
+            rect: [0; 4],
+            alive: true,
+        };
+        assert_eq!(d.title, "PRIVATE TITLE");
+        assert!(!d.short().contains("PRIVATE"));
+        assert!(!d.line().contains("PRIVATE"));
+        assert!(d.to_json().get("title").is_none());
+    }
 }

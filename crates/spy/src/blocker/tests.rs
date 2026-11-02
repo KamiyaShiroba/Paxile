@@ -5,7 +5,25 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 #[test]
+fn candidate_origin_records_helper_contamination_without_changing_evidence() {
+    let _guard = crate::tests::TEST_LOCK.lock().unwrap();
+    crate::STATE.store(crate::ST_RUNNING, Ordering::Release);
+    let source = candidate_origin(0x10, 0x20, "IME", false, 123);
+    assert_eq!(source["source_hwnd"], "0x10");
+    assert_eq!(source["focus_hwnd"], "0x20");
+    assert_eq!(source["source_class"], "IME");
+    assert_eq!(source["source_matches_focus"], false);
+    assert_eq!(source["phase"], "callwnd_before_downstream");
+    let mut evidence = CandidateEvidence::default();
+    evidence.record(0x20, 123);
+    assert!(evidence.recent(0x20, 123));
+    assert!(!evidence.recent(0x10, 123));
+}
+
+#[test]
 fn hidden_window_context_restored_on_expired_lease() {
+    let _guard = crate::tests::TEST_LOCK.lock().unwrap();
+    crate::STATE.store(crate::ST_RUNNING, Ordering::Release);
     unsafe {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),

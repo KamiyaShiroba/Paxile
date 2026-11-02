@@ -29,7 +29,7 @@ test('header settings navigation has no duplicate icon action', () => {
 });
 const preset = { name: 'CLIP Studio Paint', executables: ['CLIPStudioPaint.exe'], non_text_classes: ['742DEA58-ED6B-4402-BC11-20DFC6D08040*'] };
 const tick = () => new Promise(resolve => setTimeout(resolve, 20));
-async function boot({ update = {available:false,version:null,body:'',current_version:'0.1.0'}, checkError, installError, delays = {}, history, tray = false, preview = false, failSave = false, failSettings = false, initial = {}, available = [preset], picked = 'paint.com', status = { running: false, requested_enabled: false, error: null } } = {}) {
+async function boot({ update = {available:false,version:null,body:'',current_version:'0.1.0'}, checkError, installError, delays = {}, history, tray = false, preview = false, failSave = false, failSettings = false, initial = {}, available = [preset], picked = 'paint.com', onboardingSeen = true, status = { running: false, phase: 'off', desired_enabled: false, requested_enabled: false, error: null } } = {}) {
   const dom = new JSDOM(fs.readFileSync(path.join(root, 'index.html'), 'utf8'), { url: `http://localhost/${tray ? '?tray=1' : ''}`, runScripts: 'outside-only', pretendToBeVisual: true });
   const w = dom.window;
   w.structuredClone = structuredClone;
@@ -47,6 +47,8 @@ async function boot({ update = {available:false,version:null,body:'',current_ver
     if (command === 'check_update') { if (checkError) throw Error(checkError); return structuredClone(update); }
     if (command === 'install_update') { if (installError) throw Error(installError); return true; }
     if (command === 'get_core_status') return status;
+    if (command === 'get_onboarding_seen') return onboardingSeen;
+    if (command === 'set_onboarding_seen') { onboardingSeen = args.seen; return args.seen; }
     if (command === 'pick_program') return picked;
     if (command === 'get_logs') return history || [{ time: '1793000000000', level: 'info', msg: 'REAL CORE ENTRY' }];
     if (command === 'save_config') { if (failSave) throw Error('disk denied'); config = structuredClone(args.config); return; }
@@ -78,7 +80,7 @@ test('custom whitelist CRUD, cancel and duplicate validation',async()=>{
  const app=await boot(),{w}=app;
  click(w,'#add-button');selectType(w,'custom');w.document.querySelector('#custom-executable').value='game.exe';click(w,'#confirm-modal');await tick();
  assert.deepEqual(app.getConfig().allow_exe,['game.exe']);assert.equal(app.getConfig().presets.length,0);
- assert.match(w.document.querySelector('.row-actions button').dataset.tooltip,/白名单/);
+ assert.match(w.document.querySelector('.row-actions button').dataset.tooltip,/自定义程序/);
  click(w,'[data-edit]');w.document.querySelector('#custom-executable').value='other.exe';click(w,'#cancel-modal');assert.deepEqual(app.getConfig().allow_exe,['game.exe']);
  click(w,'[data-edit]');w.document.querySelector('#custom-executable').value='other.exe';click(w,'#confirm-modal');await tick();assert.deepEqual(app.getConfig().allow_exe,['other.exe']);
  click(w,'#add-button');selectType(w,'custom');w.document.querySelector('#custom-executable').value='OTHER.exe';click(w,'#confirm-modal');await tick();assert.match(w.document.querySelector('#modal-error').textContent,/已存在/);click(w,'#cancel-modal');
@@ -156,12 +158,45 @@ test('header controls invoke native commands; brand is noninteractive and toolti
  const app=await boot(),{w}=app;assert.equal(w.document.querySelector('.brand').tagName,'DIV');assert.equal(w.document.querySelector('.brand img').getAttribute('src'),'/icon.png');
  click(w,'#minimize-settings');click(w,'#close-settings');await tick();assert(app.calls.some(c=>c.command==='minimize_settings'));assert(app.calls.some(c=>c.command==='close_settings'));assert.equal(w.document.querySelectorAll('[title]').length,0);assert(w.document.querySelector('.topbar[data-tauri-drag-region]'));app.close();
 });
-test('live status keeps unknown requested state, polls, and cleans up on unload',async()=>{
- const status={running:true,requested_enabled:null,error:null};const app=await boot({initial:{enabled:true},status}),{w}=app;
- assert.equal(w.document.querySelector('#core-status').textContent,'运行中');assert.equal(w.document.querySelector('#global-toggle').checked,true);
- status.running=false;await new Promise(r=>setTimeout(r,1100));assert.equal(w.document.querySelector('#core-status').textContent,'未运行');assert.equal(w.document.querySelector('#global-toggle').checked,true);
- status.requested_enabled=false;await new Promise(r=>setTimeout(r,1100));assert.equal(w.document.querySelector('#global-toggle').checked,false);
+test('phase light tracks engine while the toggle follows intent and never bounces',async()=>{
+ const status={running:true,phase:'active',desired_enabled:true,requested_enabled:true,error:null};const app=await boot({initial:{enabled:true},status}),{w}=app;
+ assert.equal(w.document.querySelector('#core-status').dataset.phase,'active');
+ assert.equal(w.document.querySelector('#core-status').textContent,'拦截运行中');
+ assert.equal(w.document.querySelector('#global-toggle').checked,true);
+ // Coming up: amber light, spinner, toggle disabled but still shown as on.
+ status.phase='starting';await new Promise(r=>setTimeout(r,1100));
+ assert.equal(w.document.querySelector('#core-status').dataset.phase,'starting');
+ assert.equal(w.document.querySelector('#global-toggle').disabled,true);
+ assert(w.document.querySelector('.top-actions .toggle').classList.contains('is-starting'));
+ assert.equal(w.document.querySelector('#global-toggle').checked,true);
+ // Intent flips off: red light, toggle off and re-enabled.
+ status.phase='off';status.desired_enabled=false;await new Promise(r=>setTimeout(r,1100));
+ assert.equal(w.document.querySelector('#core-status').dataset.phase,'off');
+ assert.equal(w.document.querySelector('#global-toggle').checked,false);
+ assert.equal(w.document.querySelector('#global-toggle').disabled,false);
  w.dispatchEvent(new w.Event('beforeunload'));const before=app.calls.length;await new Promise(r=>setTimeout(r,1100));assert.equal(app.calls.length,before);app.close();
+});
+test('first run shows guidance nonblocking; skip persists; info button reopens and finishes',async()=>{
+ const app=await boot({onboardingSeen:false}),{w}=app;
+ assert.equal(w.document.querySelector('#guide').hidden,false);
+ assert.equal(w.document.querySelector('#add-button').disabled,false);
+ w.document.querySelector('.guide-skip').click();await tick();
+ assert.equal(w.document.querySelector('#guide').hidden,true);
+ assert(app.calls.some(c=>c.command==='set_onboarding_seen'&&c.args.seen===true));
+ w.document.querySelector('#guidance-button').click();
+ assert.equal(w.document.querySelector('#guide').hidden,false);
+ assert.match(w.document.querySelector('.guide-next').textContent,/开始指引/);
+ for(let i=0;i<5;i++){w.document.querySelector('.guide-next').click();await tick()}
+ assert.match(w.document.querySelector('.guide-next').textContent,/完成/);
+ assert.equal(w.document.querySelector('.guide-skip').hidden,true);
+ assert.match(w.document.querySelector('#guide-alpha').textContent,/alpha/);
+ w.document.querySelector('.guide-next').click();await tick();
+ assert.equal(w.document.querySelector('#guide').hidden,true);
+ assert.equal(app.errors.length,0);app.close();
+});
+test('seen onboarding does not auto-open the tour',async()=>{
+ const app=await boot({onboardingSeen:true}),{w}=app;await tick();
+ assert.equal(w.document.querySelector('#guide'),null);app.close();
 });
 
 test('picker failures and unsafe basenames never save a rule',async()=>{

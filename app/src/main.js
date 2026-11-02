@@ -2,8 +2,9 @@
 'use strict';
 const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
 const api=window.__TAURI__, invoke=api?.core?.invoke, preview=typeof invoke!=='function';
-const clone=x=>JSON.parse(JSON.stringify(x)), help='IME 白名单：允许此程序使用输入法，不创建拦截规则。';
-let config,catalog=[],rules=[],busy=false,started=false,editing,deleting,focus,unlisten,statusTimer,statusPending=false,disposed=false;
+const clone=x=>JSON.parse(JSON.stringify(x)), help='自定义程序：允许此程序正常使用输入法，不为其创建拦截规则。';
+let config,catalog=[],rules=[],busy=false,started=false,editing,deleting,focus,unlisten,statusTimer,statusPending=false,disposed=false,starting=false;
+const PHASE_LABEL={off:'拦截已关闭',starting:'启动中…',active:'拦截运行中',fault:'核心异常'};
 const logs=[],logKeys=new Set();
 let logFrame=0,logsDirty=false,autoReady=false,silentReady=false;
 function logsVisible(){return !document.hidden&&!$('[data-page-panel="settings"]').hidden}
@@ -28,6 +29,7 @@ function page(name){$$('[data-page]').forEach(b=>{const on=b.dataset.page===name
 function button(symbol,title,action){const b=document.createElement('button');b.type='button';b.className='icon-button';b.dataset.tooltip=title;b.setAttribute('aria-label',title);b.innerHTML=`<span class="tabler-icon-root" data-icon="${symbol}" aria-hidden="true"></span>`;b.onclick=action||(()=>{});return b}
 function lock(){
  $$('#add-button,[data-open-modal],#rule-list button,#global-toggle,#autostart,#silent-start').forEach(n=>{n.disabled=busy||!config});
+ $('#global-toggle').disabled=busy||!config||starting;
  $('#autostart').disabled=busy||!autoReady;$('#silent-start').disabled=busy||!silentReady;
  $$('#rule-modal button,#rule-modal input,#rule-modal select').forEach(n=>{n.disabled=busy});
  $('#confirm-modal').disabled=busy||(!deleting&&$('input[name=rule-type]:checked').value==='preset'&&!$('#software-select').value);
@@ -41,7 +43,7 @@ function render(){
  const actions=document.createElement('div');actions.className='row-actions';const edit=button('edit',`编辑 ${rule.name}`,()=>open(rule));edit.dataset.edit=`${rule.type}-${rule.index}`;const remove=button('trash',`删除 ${rule.name}`,()=>open(rule,true));remove.dataset.delete=`${rule.type}-${rule.index}`;remove.classList.add('danger');
  actions.append(button('info',rule.type==='custom'?help:`程序：${rule.preset.executables.join(', ')}；非文本窗口：${rule.preset.non_text_classes.join(', ')}`),edit,remove);row.append(icon,copy,actions);return row}));lock();
 }
-function choice(){const custom=$('input[name=rule-type]:checked').value==='custom';$$('.choice').forEach(n=>n.classList.toggle('is-selected',$('input',n).checked));$('#software-select').hidden=custom||deleting;$('#custom-executable').hidden=!custom||deleting;$('#custom-program-field').hidden=!custom||deleting;$('#software-field-label').textContent=custom?'IME 白名单程序':'软件';$('#software-field-label').htmlFor=custom?'custom-executable':'software-select';$('#software-field-label').hidden=deleting;lock()}
+function choice(){const custom=$('input[name=rule-type]:checked').value==='custom';$$('.choice').forEach(n=>n.classList.toggle('is-selected',$('input',n).checked));$('#software-select').hidden=custom||deleting;$('#custom-executable').hidden=!custom||deleting;$('#custom-program-field').hidden=!custom||deleting;$('#software-field-label').textContent=custom?'自定义程序':'软件';$('#software-field-label').htmlFor=custom?'custom-executable':'software-select';$('#software-field-label').hidden=deleting;lock()}
 function open(rule=null,remove=false){
  if(busy||!config)return;focus=document.activeElement;editing=rule;deleting=remove;$('#rule-modal').hidden=false;$('#app-shell').inert=true;$('#modal-error').textContent='';$('#modal-title').textContent=remove?`删除 ${rule.name}？`:rule?'编辑规则':'添加规则';$('#confirm-modal').textContent=remove?'删除':rule?'保存':'添加';$('.choice-grid').hidden=remove;
  const type=rule?.type||(catalog.length?'preset':'custom');$(`input[name=rule-type][value=${type}]`).checked=true;const options=[...catalog];if(rule?.type==='preset'&&!options.some(p=>p.name===rule.preset.name))options.push(rule.preset);
@@ -58,7 +60,7 @@ async function save(){
  try{if(!preview)await invoke('save_config',{config:next});config=preview?next:await invoke('get_config');render();busy=false;close();report(preview?'浏览器预览：修改未写入系统':'')}
  catch(error){$('#modal-error').textContent=`保存失败：${error}`;report(`保存失败：${error}`)}finally{busy=false;lock()}
 }
-function core(s){const node=$('#core-status');node.textContent=s.running?'运行中':'未运行';node.dataset.running=String(!!s.running);node.setAttribute('aria-label',s.error?`未运行，核心错误：${s.error}`:node.textContent);if(typeof s.requested_enabled==='boolean'&&!busy&&config){config.enabled=s.requested_enabled;$('#global-toggle').checked=s.requested_enabled}}
+function core(s){const node=$('#core-status'),phase=PHASE_LABEL[s.phase]?s.phase:(s.running?'active':'off'),label=PHASE_LABEL[phase];node.dataset.phase=phase;node.textContent=label;node.setAttribute('aria-label',s.error?`${label}，核心错误：${s.error}`:label);starting=phase==='starting';$('#global-toggle').closest('.toggle').classList.toggle('is-starting',starting);if(typeof s.desired_enabled==='boolean'&&!busy&&config){config.enabled=s.desired_enabled;$('#global-toggle').checked=s.desired_enabled}lock()}
 async function refreshStatus(){if(preview||disposed||statusPending||busy)return;statusPending=true;try{const status=await invoke('get_core_status');if(!disposed)core(status)}catch(error){if(!disposed){core({running:false,error:String(error),requested_enabled:null});report(`状态读取失败：${error}`)}}finally{statusPending=false}}
 function cleanup(){disposed=true;cancelAnimationFrame(logFrame);clearInterval(statusTimer);unlisten?.();hideTooltip()}
 async function pickProgram(){if(busy)return;if(preview){$('#modal-error').textContent='浏览器预览无法打开系统文件选择器';return}busy=true;lock();try{const selected=await invoke('pick_program');if(typeof selected==='string'){$('#custom-executable').value=selected;$('#custom-executable').setCustomValidity('')}}catch(error){$('#modal-error').textContent=`选择失败：${error}`}finally{busy=false;lock();$('#custom-executable').focus()}}
@@ -98,6 +100,7 @@ async function load(){if(preview){config={enabled:false,profile:'auto',presets:[
  const secondary=(task,label)=>task.catch(error=>{if(!disposed)report(`${label}失败：${error}`)});
  if(api.event?.listen)secondary(api.event.listen('paxile-log',event=>{if(!disposed)receive(event.payload)}).then(stop=>{if(disposed)stop();else unlisten=stop}),'日志订阅');
  secondary(invoke('get_logs').then(history=>{if(!disposed)receiveBatch(history)}),'日志读取');
+ secondary(invoke('get_onboarding_seen').then(seen=>{if(!disposed&&!seen)openGuide()}),'引导读取');
  for(const [id,command]of [['autostart','get_autostart'],['silent-start','get_silent_start']])secondary(invoke(command).then(value=>{if(disposed)return;$(`#${id}`).checked=!!value;if(id==='autostart')autoReady=true;else silentReady=true;lock()}),'偏好读取');
  try{const [loaded,available]=await Promise.all([invoke('get_config'),invoke('get_available_presets')]);if(disposed)return;config=loaded;catalog=available;$('#global-toggle').checked=!!config.enabled;render();refreshStatus();statusTimer=setInterval(refreshStatus,1000)}catch(error){if(!disposed){report(`读取失败：${error}`);lock()}}
 }
@@ -120,14 +123,59 @@ function setupHeaderDrag(){
   if(!preview)invoke('start_settings_drag').catch(error=>report(`窗口拖动失败：${error}`));
  });
 }
+const GUIDE=[
+ {body:'非常感谢使用 Paxile！这是一款简单的输入法冲突修复工具。需要开始操作指引吗？'},
+ {sel:'#core-status,.top-actions .toggle',page:'intercept',body:'这是总开关。开关旁的状态指示器表示当前拦截状态：\n🔴 拦截已关闭　🟡 正在启动　🟢 拦截正常运行中\n若长时间停在黄色、且多次尝试启动都失败，请第一时间提交 issue。'},
+ {sel:'#rule-list',page:'intercept',body:'「拦截」页里列出的，是当前生效的软件规则。'},
+ {sel:'#add-button',page:'intercept',body:'想追加生效的软件，点这里。'},
+ {sel:'.setting-row',page:'settings',body:'这是设置页。每个设置项的说明都在标题右侧的图标上，把光标移上去就会显示。'},
+ {sel:'#guidance-button',body:'引导到此结束！想再看一遍，随时点这里重新打开。',alpha:'温馨提示：仍处于 alpha 阶段，首次使用建议先用空白文件测试，并记得保存作品。'},
+];
+let guideStep=-1,guideFocus;
+function buildGuide(){
+ const g=document.createElement('div');g.id='guide';g.hidden=true;
+ g.innerHTML='<div class="guide-mask"></div><div class="guide-spot"></div><div class="guide-bubble" role="dialog" aria-modal="true" aria-labelledby="guide-body"><button type="button" class="guide-skip">跳过</button><p id="guide-body"></p><p id="guide-alpha" class="guide-alpha" hidden></p><div class="guide-foot"><span class="guide-progress"></span><div class="guide-nav"><button type="button" class="guide-prev">上一步</button><button type="button" class="guide-next">开始指引</button></div></div></div>';
+ document.body.append(g);
+ g.querySelector('.guide-skip').onclick=()=>finishGuide();
+ g.querySelector('.guide-prev').onclick=()=>showGuide(guideStep-1);
+ g.querySelector('.guide-next').onclick=()=>guideStep>=GUIDE.length-1?finishGuide():showGuide(guideStep+1);
+ return g;
+}
+function positionGuide(step){
+ const g=$('#guide'),spot=$('.guide-spot'),bubble=$('.guide-bubble');
+ const els=step.sel?$$(step.sel).filter(n=>n&&n.getClientRects().length):[];
+ if(!els.length){g.classList.add('is-centered');bubble.style.left=`${Math.max(8,(innerWidth-bubble.offsetWidth)/2)}px`;bubble.style.top=`${Math.max(8,(innerHeight-bubble.offsetHeight)/2)}px`;return}
+ g.classList.remove('is-centered');
+ let l=Infinity,t=Infinity,r=-Infinity,b=-Infinity;
+ for(const n of els){const q=n.getBoundingClientRect();l=Math.min(l,q.left);t=Math.min(t,q.top);r=Math.max(r,q.right);b=Math.max(b,q.bottom)}
+ const pad=6;l-=pad;t-=pad;r+=pad;b+=pad;
+ spot.style.left=`${l}px`;spot.style.top=`${t}px`;spot.style.width=`${Math.max(0,r-l)}px`;spot.style.height=`${Math.max(0,b-t)}px`;
+ const bw=bubble.offsetWidth,bh=bubble.offsetHeight,gap=12;
+ let by=b+gap,bx=Math.min(Math.max(8,l),Math.max(8,innerWidth-bw-8));
+ if(by+bh>innerHeight-8)by=Math.max(8,t-gap-bh);
+ bubble.style.left=`${bx}px`;bubble.style.top=`${by}px`;
+}
+function showGuide(i){
+ guideStep=i;const step=GUIDE[i];
+ if(step.page)page(step.page);
+ $('#guide-body').textContent=step.body;
+ const alpha=$('#guide-alpha');alpha.hidden=!step.alpha;alpha.textContent=step.alpha||'';
+ $('.guide-progress').textContent=`${i+1} / ${GUIDE.length}`;
+ $('.guide-prev').hidden=i===0;$('.guide-skip').hidden=i===GUIDE.length-1;
+ $('.guide-next').textContent=i===0?'开始指引':i===GUIDE.length-1?'完成':'下一步';
+ requestAnimationFrame(()=>{positionGuide(step);$('.guide-next').focus()});
+}
+function openGuide(){if(!$('#guide'))buildGuide();guideFocus=document.activeElement;$('#app-shell').inert=true;$('#guide').hidden=false;showGuide(0)}
+async function finishGuide(){const g=$('#guide');if(!g||g.hidden)return;g.hidden=true;guideStep=-1;$('#app-shell').inert=false;(guideFocus?.isConnected?guideFocus:$('#guidance-button'))?.focus?.();if(!preview){try{await invoke('set_onboarding_seen',{seen:true})}catch(error){report(`引导状态保存失败：${error}`)}}}
 function init(){if(started)return;started=true;if(new URLSearchParams(location.search).get('tray')==='1'){tray();return}
  const status=document.createElement('div');status.id='ui-status';status.setAttribute('role','status');$('.topbar').after(status);const error=document.createElement('div');error.id='modal-error';error.setAttribute('role','alert');$('.modal-actions').before(error);
- const info=document.createElement('span');info.id='core-status';info.setAttribute('role','status');info.dataset.running='false';info.textContent='未运行';$('.top-actions').prepend(info);
+ const info=document.createElement('span');info.id='core-status';info.setAttribute('role','status');info.dataset.phase='off';info.textContent=PHASE_LABEL.off;$('.top-actions').prepend(info);
+ const guide=button('info','使用指引',openGuide);guide.id='guidance-button';guide.classList.add('brand-info');$('.brand').append(guide);
  for(const [id,symbol,label,command]of [['minimize-settings','minus','最小化','minimize_settings'],['close-settings','close','关闭窗口','close_settings']]){const control=button(symbol,label,async()=>{try{if(!preview)await invoke(command)}catch(error){report(`窗口操作失败：${error}`)}});control.id=id;control.classList.add('window-control');$('.top-actions').append(control)}
  const input=$('#custom-executable'),field=document.createElement('div');field.id='custom-program-field';field.className='custom-program-field';input.before(field);field.append(input);const picker=button('folder','选择程序文件',pickProgram);picker.id='pick-program';field.append(picker);
  $$('[title]').forEach(n=>{n.dataset.tooltip=n.getAttribute('title');n.removeAttribute('title')});$$('svg use').forEach(n=>{const host=document.createElement('span');host.className='tabler-icon-root';host.dataset.icon=n.getAttribute('href').replace('#icon-','');host.setAttribute('aria-hidden','true');n.closest('svg').replaceWith(host)});$('.svg-defs')?.remove();setupTooltips();
  $$('.eyebrow,.setting-row p,.empty-state p,.choice small').forEach(n=>n.remove());$$('.setting-row h2').forEach(n=>n.append(button('info',n.textContent.includes('静默')?'启动时不打开设置窗口。':'登录 Windows 后自动运行 Paxile。')));
- const custom=$('input[value=custom]').closest('label');$('strong',custom).textContent='IME 白名单';custom.dataset.tooltip=help;$('#custom-executable').dataset.tooltip=help;$('#custom-executable').setAttribute('aria-label','IME 白名单可执行文件名');$('.live-dot').remove();
+ const custom=$('input[value=custom]').closest('label');custom.dataset.tooltip=help;$('#custom-executable').dataset.tooltip=help;$('#custom-executable').setAttribute('aria-label','自定义程序可执行文件名');$('.live-dot').remove();
  $$('[data-page]').forEach(b=>{b.onclick=()=>page(b.dataset.page)});$('#add-button').onclick=()=>open();$('[data-open-modal]').onclick=()=>open();$('#close-modal').onclick=close;$('#cancel-modal').onclick=close;$('#confirm-modal').onclick=save;
  $$('input[name=rule-type]').forEach(n=>{n.onchange=choice});$('#custom-executable').oninput=e=>e.target.setCustomValidity('');$('#rule-modal').onclick=e=>{if(e.target===e.currentTarget)close()};
  document.addEventListener('keydown',e=>{if($('#rule-modal').hidden)return;if(e.key==='Escape'){e.preventDefault();close()}if(e.key==='Enter'&&!e.target.matches('button')){e.preventDefault();save()}if(e.key!=='Tab')return;const nodes=$$('button,input,select',$('#rule-modal')).filter(n=>!n.disabled&&!n.hidden&&!n.closest('[hidden]')),first=nodes[0],last=nodes.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus()}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus()}});
@@ -135,6 +183,8 @@ function init(){if(started)return;started=true;if(new URLSearchParams(location.s
  $('#install-update').onclick=installUpdate;$('#confirm-update').onclick=confirmUpdate;$('#cancel-update').onclick=closeUpdate;$('#close-update').onclick=closeUpdate;$('#update-modal').onclick=e=>{if(e.target===e.currentTarget)closeUpdate()};
  document.addEventListener('keydown',e=>{if($('#update-modal').hidden)return;if(e.key==='Escape'){e.preventDefault();closeUpdate()}if(e.key==='Tab'){const nodes=$$('button',$('#update-modal')),first=nodes[0],last=nodes.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}}});
  $('#check-update').onclick=checkUpdate;updateControls();if(preview){$('#update-version').textContent='版本信息暂不可用';$('#update-status').textContent='浏览器预览无法检查更新'}else checkUpdate();
+ document.addEventListener('keydown',e=>{const g=$('#guide');if(!g||g.hidden)return;if(e.key==='Escape'){e.preventDefault();finishGuide();return}if(e.key!=='Tab')return;const nodes=$$('.guide-bubble button').filter(n=>!n.hidden);const first=nodes[0],last=nodes.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}});
+ window.addEventListener('resize',()=>{const g=$('#guide');if(g&&!g.hidden&&guideStep>=0)positionGuide(GUIDE[guideStep])});
  setupHeaderDrag();$('#log-list').addEventListener('scroll',paintLogs);window.addEventListener('resize',scheduleLogs);document.addEventListener('visibilitychange',scheduleLogs);window.addEventListener('beforeunload',cleanup,{once:true});lock();load();
 }
 document.addEventListener('DOMContentLoaded',init);if(document.readyState!=='loading')init();

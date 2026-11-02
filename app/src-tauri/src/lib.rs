@@ -330,10 +330,16 @@ fn get_status(state: State<AppState>) -> Status {
 async fn set_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
     blocking(move || {
         let state = app.state::<AppState>();
-        let _update = state.update_lock.lock().unwrap();
-        let mut next = state.config.lock().unwrap().clone();
-        next.enabled = enabled;
-        commit_config(&app, &state, next, false)?;
+        {
+            // Release the update lock before refreshing, which re-acquires it.
+            let _update = state.update_lock.lock().unwrap();
+            let mut next = state.config.lock().unwrap().clone();
+            next.enabled = enabled;
+            commit_config(&app, &state, next, false)?;
+        }
+        // Refresh the cached status now so the UI sees the new phase at once
+        // instead of waiting for the next background poll.
+        runtime::refresh_status(&app);
         Ok(enabled)
     })
     .await
@@ -373,6 +379,24 @@ async fn set_silent_start(app: AppHandle, on: bool) -> Result<bool, String> {
         config::save_preferences(&app, &preference)?;
         *state.silent_start.lock().unwrap() = on;
         Ok(on)
+    })
+    .await
+}
+
+#[tauri::command]
+fn get_onboarding_seen(app: AppHandle) -> bool {
+    config::load_preferences(&app).onboarding_seen
+}
+
+#[tauri::command]
+async fn set_onboarding_seen(app: AppHandle, seen: bool) -> Result<bool, String> {
+    blocking(move || {
+        let state = app.state::<AppState>();
+        let _update = state.update_lock.lock().unwrap();
+        let mut preference = config::load_preferences(&app);
+        preference.onboarding_seen = seen;
+        config::save_preferences(&app, &preference)?;
+        Ok(seen)
     })
     .await
 }
@@ -583,6 +607,8 @@ pub fn run() {
             set_autostart,
             get_silent_start,
             set_silent_start,
+            get_onboarding_seen,
+            set_onboarding_seen,
             open_settings_window,
             pick_program,
             start_settings_drag,

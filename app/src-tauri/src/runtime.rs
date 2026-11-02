@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::{
     collections::VecDeque,
     io::{BufRead, BufReader},
-    process::{Child, Command, Stdio},
+    process::{Child, Command},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager};
@@ -36,12 +36,60 @@ impl LogBuffer {
         entry
     }
 }
+/// What the status light shows. `desired_enabled` carries the user's intent so
+/// the toggle never bounces on a transient engine read; `phase` drives the
+/// red/amber/green indicator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    /// Blocking is switched off.
+    #[default]
+    Off,
+    /// Switched on, but the engine has not yet confirmed it is blocking.
+    Starting,
+    /// Engine is running and has accepted the enable request.
+    Active,
+    /// Switched on but the engine exited or reported a fault.
+    Fault,
+}
 #[derive(Clone, Default, Serialize)]
 pub struct CoreStatus {
     pub running: bool,
     pub requested_enabled: Option<bool>,
     pub applied_enabled: Option<bool>,
+    /// The persisted intent (config.enabled); the toggle position follows this.
+    pub desired_enabled: bool,
+    pub phase: Phase,
     pub error: Option<String>,
+}
+/// Derive the indicator phase from intent, liveness, the engine's acknowledged
+/// state and whether a fault is recorded. Pure so it can be unit-tested.
+pub fn compute_phase(
+    desired: bool,
+    running: bool,
+    requested: Option<bool>,
+    has_error: bool,
+) -> Phase {
+    if !desired {
+        return Phase::Off;
+    }
+    if !running {
+        return if has_error {
+            Phase::Fault
+        } else {
+            Phase::Starting
+        };
+    }
+    match requested {
+        // Engine confirms on and nothing is wrong: truly blocking.
+        Some(true) if !has_error => Phase::Active,
+        // Engine confirms on but a fault is recorded (e.g. a spy failed to load).
+        Some(true) => Phase::Fault,
+        // Intent is on but the engine has not caught up, or the channel is not
+        // yet answering: still coming up.
+        Some(false) | None if !has_error => Phase::Starting,
+        _ => Phase::Fault,
+    }
 }
 pub fn log(app: &AppHandle, level: &str, msg: &str) {
     if level == "error"
@@ -67,25 +115,24 @@ fn hidden(command: &mut Command) {
         command.creation_flags(0x08000000);
     }
 }
+#[path = "runtime_launch.rs"]
+mod launch;
+
 pub fn start(app: &AppHandle) -> Result<Child, String> {
     let probe = crate::probe_path(app).ok_or("找不到匹配的引擎 EXE / DLL")?;
     if !probe.with_file_name("paxile_spy.dll").is_file() {
         return Err("缺少 paxile_spy.dll".into());
     }
-    let mut command = Command::new(probe);
-    command
-        .args([
-            "watch",
-            "--managed",
-            "--spy",
-            "--block",
-            "--no-file",
-            "--config",
-        ])
-        .arg(crate::config::config_path(app)?)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let config = crate::config::config_path(app)?;
+    let debug_log = std::env::var_os("PAXILE_DEBUG_LOG");
+    let mut command = launch::command(&probe, &config, debug_log.as_deref())?;
+    if let Some(directory) = command.get_current_dir() {
+        // The probe's logger writes relative to logs/ inside its working directory.
+        log(app, "info", &format!(
+            "诊断文件日志已启用（PAXILE_DEBUG_LOG=1）；日志目录：{}。不记录输入正文；分享前请检查诊断元数据。",
+            directory.join("logs").display()
+        ));
+    }
     hidden(&mut command);
     let mut child = command.spawn().map_err(|e| e.to_string())?;
     let stdout = child.stdout.take().unwrap();
@@ -186,23 +233,16 @@ pub fn cached_status(state: &AppState) -> CoreStatus {
     state.core_status.lock().unwrap().clone()
 }
 
-fn snapshot_from_status(
-    running: bool,
+fn resolve_status(
     response: Result<serde_json::Value, String>,
     prior_error: Option<String>,
-) -> CoreStatus {
-    let (requested_enabled, error) = match response {
+) -> (Option<bool>, Option<String>) {
+    match response {
         Ok(value) => match value["status"]["requested_enabled"].as_bool() {
             Some(enabled) => (Some(enabled), prior_error),
             None => (None, Some("invalid engine status".into())),
         },
         Err(error) => (None, Some(error)),
-    };
-    CoreStatus {
-        running,
-        requested_enabled,
-        applied_enabled: None,
-        error,
     }
 }
 
@@ -210,6 +250,7 @@ pub fn refresh_status(app: &AppHandle) -> CoreStatus {
     let state = app.state::<AppState>();
     // A poll must not interleave with reload/on/off/persist/compensation.
     let _update = state.update_lock.lock().unwrap();
+    let desired = state.config.lock().unwrap().enabled;
     let mut guard = state.backend.lock().unwrap();
     let running = match guard.as_mut() {
         Some(child) => match child.try_wait() {
@@ -227,14 +268,19 @@ pub fn refresh_status(app: &AppHandle) -> CoreStatus {
     };
     let pid = guard.as_ref().map(Child::id);
     drop(guard);
-    let error = state.core_error.lock().unwrap().clone();
-    let snapshot = if running {
-        snapshot_from_status(true, control(app, pid.unwrap(), "status"), error)
+    let prior_error = state.core_error.lock().unwrap().clone();
+    let (requested_enabled, error) = if running {
+        resolve_status(control(app, pid.unwrap(), "status"), prior_error)
     } else {
-        CoreStatus {
-            error,
-            ..CoreStatus::default()
-        }
+        (None, prior_error)
+    };
+    let snapshot = CoreStatus {
+        running,
+        requested_enabled,
+        applied_enabled: None,
+        desired_enabled: desired,
+        phase: compute_phase(desired, running, requested_enabled, error.is_some()),
+        error,
     };
     *state.core_status.lock().unwrap() = snapshot.clone();
     snapshot
@@ -281,21 +327,37 @@ mod tests {
     use super::*;
     #[test]
     fn failed_status_keeps_running_but_never_claims_disabled_or_applied() {
-        let snapshot = snapshot_from_status(true, Err("control timed out".into()), None);
-        assert!(snapshot.running);
-        assert_eq!(snapshot.requested_enabled, None);
-        assert_eq!(snapshot.applied_enabled, None);
-        assert_eq!(snapshot.error.as_deref(), Some("control timed out"));
-        let malformed = snapshot_from_status(true, Ok(serde_json::json!({"status": {}})), None);
-        assert_eq!(malformed.requested_enabled, None);
-        assert!(malformed.error.is_some());
-        let off = snapshot_from_status(
-            true,
+        let (requested, error) = resolve_status(Err("control timed out".into()), None);
+        assert_eq!(requested, None);
+        assert_eq!(error.as_deref(), Some("control timed out"));
+        let (requested, error) = resolve_status(Ok(serde_json::json!({"status": {}})), None);
+        assert_eq!(requested, None);
+        assert!(error.is_some());
+        let (requested, error) = resolve_status(
             Ok(serde_json::json!({"status":{"requested_enabled":false}})),
             None,
         );
-        assert_eq!(off.requested_enabled, Some(false));
-        assert_eq!(off.applied_enabled, None);
+        assert_eq!(requested, Some(false));
+        assert_eq!(error, None);
+    }
+    #[test]
+    fn phase_tracks_intent_liveness_and_faults() {
+        // Off whenever intent is off, regardless of the engine.
+        assert_eq!(compute_phase(false, true, Some(true), false), Phase::Off);
+        assert_eq!(compute_phase(false, false, None, true), Phase::Off);
+        // Coming up: desired on but engine not confirming yet.
+        assert_eq!(compute_phase(true, false, None, false), Phase::Starting);
+        assert_eq!(
+            compute_phase(true, true, Some(false), false),
+            Phase::Starting
+        );
+        assert_eq!(compute_phase(true, true, None, false), Phase::Starting);
+        // Active only when running, acknowledged and clean.
+        assert_eq!(compute_phase(true, true, Some(true), false), Phase::Active);
+        // Faults: exited, or on-but-errored.
+        assert_eq!(compute_phase(true, false, None, true), Phase::Fault);
+        assert_eq!(compute_phase(true, true, Some(true), true), Phase::Fault);
+        assert_eq!(compute_phase(true, true, None, true), Phase::Fault);
     }
     #[test]
     fn cached_reads_do_not_wait_for_a_delayed_control_transaction() {

@@ -1,5 +1,5 @@
 //! paxile-spy: loaded into the target's UI thread(s) by paxile-probe via
-//! SetWindowsHookEx(WH_GETMESSAGE / WH_CALLWNDPROC). Read-only unless a
+//! SetWindowsHookEx(WH_GETMESSAGE / WH_CALLWNDPROC / WH_CALLWNDPROCRET). Read-only unless a
 //! validated probe config and live heartbeat explicitly enable blocking.
 //! Messages are never altered or swallowed. See blocker.rs for IMM mutations.
 //!
@@ -9,6 +9,10 @@
 //! controller goes away; owner-thread timers independently fail open.
 
 mod blocker;
+#[cfg(test)]
+mod tests;
+#[cfg(feature = "passive-tsf")]
+mod tsf;
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -29,11 +33,12 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::Ime::{
     ImmGetCompositionStringW, ImmGetContext, ImmGetConversionStatus, ImmGetOpenStatus,
-    ImmReleaseContext, GCS_COMPSTR, GCS_RESULTSTR, HIMC, IME_COMPOSITION_STRING,
+    ImmGetVirtualKey, ImmReleaseContext, GCS_COMPSTR, GCS_RESULTSTR, HIMC, IME_COMPOSITION_STRING,
     IME_CONVERSION_MODE, IME_SENTENCE_MODE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetClassNameW, CWPSTRUCT, HHOOK, MSG,
+    CallNextHookEx, GetClassNameW, GetGUIThreadInfo, GetWindowThreadProcessId, CWPRETSTRUCT,
+    CWPSTRUCT, GUITHREADINFO, HHOOK, MSG,
 };
 
 const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
@@ -46,6 +51,23 @@ const ST_DEAD: u8 = 2;
 
 static STATE: AtomicU8 = AtomicU8::new(ST_IDLE);
 static BUF: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn qpc_now() -> i64 {
+    let mut qpc = 0;
+    let _ = unsafe { QueryPerformanceCounter(&mut qpc) };
+    qpc
+}
+
+fn stamp(mut value: Value) -> String {
+    value["qpc"] = json!(qpc_now());
+    value["pid"] = json!(unsafe { GetCurrentProcessId() });
+    value["tid"] = json!(unsafe { GetCurrentThreadId() });
+    value["seq"] = json!(SEQ.fetch_add(1, Ordering::Relaxed) + 1);
+    value["dropped"] = json!(DROPPED.load(Ordering::Relaxed));
+    value.to_string()
+}
 
 // ---------------------------------------------------------------- hook procs
 
@@ -53,13 +75,33 @@ static BUF: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Called by Windows with a valid hook payload for `code == HC_ACTION`.
 #[no_mangle]
 pub unsafe extern "system" fn paxile_getmsg_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let hook_entry_qpc = qpc_now();
     // Let the rest of the chain (e.g. TSF's own message hook) run first, so we
     // see the message as the app will: an IME-eaten key shows as VK_PROCESSKEY.
     let before = (code == 0 && wp.0 & PM_REMOVE != 0).then(|| *(lp.0 as *const MSG));
     let r = CallNextHookEx(HHOOK::default(), code, wp, lp);
+    let downstream_return_qpc = qpc_now();
     if let Some(b) = before {
         let after = *(lp.0 as *const MSG);
         let _ = catch_unwind(AssertUnwindSafe(|| {
+            hook_phase(
+                "post",
+                after.hwnd,
+                after.message,
+                "before_observe",
+                hook_entry_qpc,
+                Some(downstream_return_qpc),
+            )
+        }));
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            if snapshot_selected(after.message) {
+                owner_snapshot(
+                    "pre_translate_before_observe",
+                    after.hwnd,
+                    after.message,
+                    after.wParam,
+                );
+            }
             blocker::observe(after.hwnd, after.message, after.wParam, after.lParam, true)
         }));
         let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -72,6 +114,16 @@ pub unsafe extern "system" fn paxile_getmsg_proc(code: i32, wp: WPARAM, lp: LPAR
                 Some(&b),
             )
         }));
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            hook_phase(
+                "post",
+                after.hwnd,
+                after.message,
+                "after_observe",
+                hook_entry_qpc,
+                Some(downstream_return_qpc),
+            )
+        }));
     }
     r
 }
@@ -80,16 +132,173 @@ pub unsafe extern "system" fn paxile_getmsg_proc(code: i32, wp: WPARAM, lp: LPAR
 /// Called by Windows with a valid CWPSTRUCT for `code == HC_ACTION`.
 #[no_mangle]
 pub unsafe extern "system" fn paxile_callwnd_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let hook_entry_qpc = qpc_now();
     if code == 0 {
         let c = *(lp.0 as *const CWPSTRUCT);
         let _ = catch_unwind(AssertUnwindSafe(|| {
+            hook_phase(
+                "send",
+                c.hwnd,
+                c.message,
+                "before_observe",
+                hook_entry_qpc,
+                None,
+            )
+        }));
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            if snapshot_selected(c.message) {
+                owner_snapshot("pre_sent_before_observe", c.hwnd, c.message, c.wParam);
+            }
             blocker::observe(c.hwnd, c.message, c.wParam, c.lParam, false)
         }));
         let _ = catch_unwind(AssertUnwindSafe(|| {
             on_msg("send", c.hwnd, c.message, c.wParam, c.lParam, None)
         }));
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            hook_phase(
+                "send",
+                c.hwnd,
+                c.message,
+                "after_observe",
+                hook_entry_qpc,
+                None,
+            )
+        }));
+    }
+    let r = CallNextHookEx(HHOOK::default(), code, wp, lp);
+    let downstream_return_qpc = qpc_now();
+    if code == 0 {
+        let c = *(lp.0 as *const CWPSTRUCT);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            hook_phase(
+                "send",
+                c.hwnd,
+                c.message,
+                "downstream_return",
+                hook_entry_qpc,
+                Some(downstream_return_qpc),
+            )
+        }));
+    }
+    r
+}
+
+/// # Safety
+/// Windows supplies a CWPRETSTRUCT for HC_ACTION. Message lParam is never dereferenced.
+#[no_mangle]
+pub unsafe extern "system" fn paxile_callwndret_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == 0 {
+        let c = *(lp.0 as *const CWPRETSTRUCT);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            if let Some(record) =
+                sent_return_record(c.hwnd, c.message, c.wParam, c.lParam, c.lResult)
+            {
+                push_value(record);
+                owner_snapshot("post_sent_wndproc", c.hwnd, c.message, c.wParam);
+            }
+        }));
     }
     CallNextHookEx(HHOOK::default(), code, wp, lp)
+}
+
+fn snapshot_selected(msg: u32) -> bool {
+    matches!(
+        msg,
+        0x0100 | 0x0104 | 0x0007 | 0x0008 | 0x0201 | 0x0204 | 0x0246
+    )
+}
+
+fn sent_return_record(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    _lp: LPARAM,
+    result: LRESULT,
+) -> Option<Value> {
+    if !snapshot_selected(msg)
+        && !matches!(msg, 0x0087 | 0x010d..=0x010f | 0x0281 | 0x0282 | 0x0288)
+    {
+        return None;
+    }
+    let mut record = json!({"backend":"sent_return", "src":"callwndret", "phase":"wndproc_return",
+        "hwnd":format!("{:#x}",hwnd.0 as usize), "msg":msg_name(msg),
+        "request":if msg == 0x0288 {Some(wp.0)} else {None}, "lresult":result.0,
+        "reentry_depth":blocker::reentry_depth()});
+    if msg == 0x0087 {
+        // WM_GETDLGCODE is a natural sent query. The wParam is the original
+        // key; lParam is intentionally opaque and is never dereferenced.
+        record["natural"] = json!(true);
+        record["original_key"] = json!(wp.0);
+        record["owner_snapshot"] = owner_snapshot_metadata(hwnd);
+    }
+    Some(record)
+}
+
+fn owner_snapshot_metadata(hwnd: HWND) -> Value {
+    let mut gui = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    let valid = unsafe { GetGUIThreadInfo(GetCurrentThreadId(), &mut gui).is_ok() };
+    json!({
+        "hwnd": format!("{:#x}", hwnd.0 as usize),
+        "class": class_of(hwnd),
+        "gui_valid": valid,
+        "focus_hwnd": if valid { Some(format!("{:#x}", gui.hwndFocus.0 as usize)) } else { None::<String> },
+        "caret_hwnd": if valid { Some(format!("{:#x}", gui.hwndCaret.0 as usize)) } else { None::<String> },
+        "thread_id": unsafe { GetCurrentThreadId() },
+    })
+}
+
+#[cfg(any(feature = "passive-tsf", test))]
+fn tsf_result(stage: &str, hresult: i32, present: bool) -> Value {
+    json!({"stage":stage, "hresult":hresult,
+        "state":if hresult < 0 {"error"} else if present {"present"} else {"absent"}})
+}
+
+fn owner_snapshot(phase: &str, hwnd: HWND, msg: u32, wp: WPARAM) {
+    // Never query a foreign owner thread, nor call ImmGetVirtualKey after TranslateMessage.
+    if hwnd.0.is_null()
+        || unsafe { GetWindowThreadProcessId(hwnd, None) } != unsafe { GetCurrentThreadId() }
+    {
+        return;
+    }
+    let mut gui = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    let valid = unsafe { GetGUIThreadInfo(GetCurrentThreadId(), &mut gui).is_ok() };
+    let mut record = json!({"backend":"owner_snapshot", "phase":phase, "msg":msg_name(msg),
+        "hwnd":format!("{:#x}",hwnd.0 as usize), "gui_valid":valid,
+        "focus_hwnd":if valid {Some(format!("{:#x}",gui.hwndFocus.0 as usize))} else {None},
+        "caret_hwnd":if valid {Some(format!("{:#x}",gui.hwndCaret.0 as usize))} else {None},
+        "gui_flags":if valid {Some(gui.flags.0)} else {None}, "reentry_depth":blocker::reentry_depth()});
+    #[cfg(feature = "passive-tsf")]
+    if snapshot_selected(msg) {
+        record["tsf"] = tsf::snapshot();
+    }
+    ime_state(hwnd, 0, LPARAM(0), record.as_object_mut().unwrap());
+    if phase == "pre_translate_before_observe" && matches!(msg, 0x0100 | 0x0104) && wp.0 == 0xe5 {
+        record["imm_virtual_key"] = json!(unsafe { ImmGetVirtualKey(hwnd) });
+    }
+    push_value(record);
+}
+
+fn hook_phase(
+    src: &str,
+    hwnd: HWND,
+    msg: u32,
+    phase: &str,
+    hook_entry_qpc: i64,
+    downstream_return_qpc: Option<i64>,
+) {
+    if let Some(msg) = msg_name(msg) {
+        push_value(json!({"backend":"hook_timing", "src":src, "msg":msg,
+            "hwnd":format!("{:#x}",hwnd.0 as usize), "phase":phase,
+            "hook_entry_qpc":hook_entry_qpc, "downstream_return_qpc":downstream_return_qpc,
+            "observe_end_qpc":if phase == "after_observe" {Some(qpc_now())} else {None},
+            "reentry_depth":blocker::reentry_depth()}));
+    }
 }
 
 // ---------------------------------------------------------------- formatting
@@ -99,6 +308,7 @@ fn msg_name(m: u32) -> Option<&'static str> {
         0x0006 => "WM_ACTIVATE",
         0x0007 => "WM_SETFOCUS",
         0x0008 => "WM_KILLFOCUS",
+        0x0087 => "WM_GETDLGCODE",
         0x0050 => "WM_INPUTLANGCHANGEREQUEST",
         0x0051 => "WM_INPUTLANGCHANGE",
         0x0100 => "WM_KEYDOWN",
@@ -152,20 +362,13 @@ fn class_of(h: HWND) -> String {
     String::from_utf16_lossy(&b[..n.max(0) as usize])
 }
 
-fn comp_string(himc: HIMC, which: IME_COMPOSITION_STRING) -> Option<String> {
+fn comp_len(himc: HIMC, which: IME_COMPOSITION_STRING) -> Option<usize> {
     unsafe {
         let bytes = ImmGetCompositionStringW(himc, which, None, 0);
         if bytes <= 0 {
             return None;
         }
-        let mut buf = vec![0u16; bytes as usize / 2];
-        let got = ImmGetCompositionStringW(
-            himc,
-            which,
-            Some(buf.as_mut_ptr() as *mut c_void),
-            bytes as u32,
-        );
-        (got > 0).then(|| String::from_utf16_lossy(&buf[..got as usize / 2]))
+        Some(bytes as usize / 2)
     }
 }
 
@@ -179,19 +382,25 @@ fn ime_state(h: HWND, msg: u32, lp: LPARAM, out: &mut Map<String, Value>) {
         }
         let mut conv = IME_CONVERSION_MODE(0);
         let mut sent = IME_SENTENCE_MODE(0);
-        let _ = ImmGetConversionStatus(himc, Some(&mut conv), Some(&mut sent));
+        let conversion_valid =
+            ImmGetConversionStatus(himc, Some(&mut conv), Some(&mut sent)).as_bool();
+        out.insert("conversion_valid".into(), json!(conversion_valid));
+        out.insert(
+            "himc_handle".into(),
+            json!(format!("{:#x}", himc.0 as usize)),
+        );
         out.insert("himc".into(), json!(true));
         out.insert("open".into(), json!(ImmGetOpenStatus(himc).as_bool()));
         out.insert("conv".into(), json!(conv.0));
         if msg == 0x010F {
             if lp.0 as u32 & GCS_COMPSTR.0 != 0 {
-                if let Some(s) = comp_string(himc, GCS_COMPSTR) {
-                    out.insert("comp".into(), json!(s));
+                if let Some(s) = comp_len(himc, GCS_COMPSTR) {
+                    out.insert("comp_len".into(), json!(s));
                 }
             }
             if lp.0 as u32 & GCS_RESULTSTR.0 != 0 {
-                if let Some(s) = comp_string(himc, GCS_RESULTSTR) {
-                    out.insert("result".into(), json!(s));
+                if let Some(s) = comp_len(himc, GCS_RESULTSTR) {
+                    out.insert("result_len".into(), json!(s));
                 }
             }
         }
@@ -215,8 +424,11 @@ fn on_msg(src: &str, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, before: Optio
     r.insert("msg".into(), json!(name));
     r.insert("hwnd".into(), json!(format!("{:#x}", hwnd.0 as usize)));
     r.insert("class".into(), json!(class));
-    r.insert("wp".into(), json!(wp.0));
-    r.insert("lp".into(), json!(lp.0));
+    // Character wParam itself is text, not just the derived `ch` field.
+    if !matches!(msg, 0x0102 | 0x0106 | 0x0286 | 0x010f) {
+        r.insert("wp".into(), json!(wp.0));
+        r.insert("lp".into(), json!(lp.0));
+    }
     match msg {
         0x0100 | 0x0101 | 0x0104 | 0x0105 => {
             r.insert("vk".into(), json!(wp.0));
@@ -229,9 +441,7 @@ fn on_msg(src: &str, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, before: Optio
             }
         }
         0x0102 | 0x0106 | 0x0286 => {
-            if let Some(c) = char::from_u32(wp.0 as u32) {
-                r.insert("ch".into(), json!(c.to_string()));
-            }
+            r.insert("text_redacted".into(), json!(true));
         }
         0x0282 => {
             r.insert("sub".into(), json!(imn_name(wp.0)));
@@ -241,21 +451,35 @@ fn on_msg(src: &str, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, before: Optio
     if class != "IME" && class != "MSCTFIME UI" {
         ime_state(hwnd, msg, lp, &mut r);
     }
-    push(Value::Object(r).to_string());
+    push_value(Value::Object(r));
 }
 
 // ---------------------------------------------------------------- transport
 
 fn push(line: String) {
+    push_value(serde_json::from_str(&line).expect("internal diagnostic object"));
+}
+
+fn push_value(value: Value) {
     match STATE.load(Ordering::Acquire) {
-        ST_DEAD => return,
+        ST_DEAD => {
+            SEQ.fetch_add(1, Ordering::Relaxed);
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         ST_IDLE => start_worker(),
         _ => {}
     }
     if let Ok(mut b) = BUF.lock() {
+        let line = stamp(value);
         if b.len() < MAX_BUFFERED {
             b.push(line);
+        } else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
         }
+    } else {
+        SEQ.fetch_add(1, Ordering::Relaxed);
+        DROPPED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -303,6 +527,7 @@ unsafe extern "system" fn worker(p: *mut c_void) -> u32 {
     let _ = catch_unwind(run_worker);
     STATE.store(ST_DEAD, Ordering::Release);
     if let Ok(mut b) = BUF.lock() {
+        DROPPED.fetch_add(b.len() as u64, Ordering::Relaxed);
         *b = Vec::new();
     }
     FreeLibraryAndExitThread(HMODULE(p), 0)
@@ -319,6 +544,7 @@ fn run_worker() {
             blocker::SESSION.fetch_add(1, Ordering::AcqRel);
         }
         if let Ok(mut buffer) = BUF.lock() {
+            DROPPED.fetch_add(buffer.len() as u64, Ordering::Relaxed);
             buffer.clear();
         }
         unsafe { Sleep(100) };
@@ -369,8 +595,15 @@ fn run_session() {
             *c = Some(config);
         }
 
-        let hello =
-            json!({ "hello": true, "pid": GetCurrentProcessId(), "tid": GetCurrentThreadId() });
+        let hello = stamp(json!({"hello":true,
+        "build_identity": concat!("paxile-spy/", env!("CARGO_PKG_VERSION"), "/preview-passive-v4"),
+        "diagnostic_schema":4,
+        "passive_tsf_enabled":cfg!(feature = "passive-tsf"),
+        "capabilities":if cfg!(feature = "passive-tsf") {
+            vec!["producer_timeline", "hook_phases", "candidate_origin", "restore_reason", "text_redacted", "sent_return", "owner_snapshot", "imm_operation", "reentry_depth", "candidate_each_notify", "dlgcode_return", "tsf_owner_thread_passive"]
+        } else {
+            vec!["producer_timeline", "hook_phases", "candidate_origin", "restore_reason", "text_redacted", "sent_return", "owner_snapshot", "imm_operation", "reentry_depth", "candidate_each_notify", "dlgcode_return"]
+        }}));
         let mut out = format!("{hello}\n");
         let mut idle_ms = 0u32;
         let mut commands = Vec::new();
