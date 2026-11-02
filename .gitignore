@@ -21,3 +21,12 @@ app/src-tauri/gen/
 Thumbs.db
 Desktop.ini
 *.tmp
+
+# Local diagnostic/experimental scratch (not part of the product build)
+app/src-tauri/tauri.observation-v2.conf.json
+app/src-tauri/tauri.passive-v3.conf.json
+app/src-tauri/tauri.passive-v4.conf.json
+app/src-tauri/tauri.preview.conf.json
+crates/spy/PASSIVE_TSF.md
+docs/magic-switch-static-analysis.md
+docs/preview-*.md
