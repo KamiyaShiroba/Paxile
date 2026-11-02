@@ -64,6 +64,30 @@ fn resolve_spy_dll(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
+/// Best-effort removal of spy DLLs left behind by earlier versions, run whenever
+/// the engine starts. The DLL we are about to load is always kept; any file still
+/// mapped (and locked) inside a host application simply fails to delete and is
+/// retried on the next start. Names are matched case-insensitively so the loaded
+/// file is never removed by accident.
+fn cleanup_other_spy_dlls(dir: &std::path::Path, keep: &std::path::Path) {
+    let keep_name = keep.file_name().and_then(|n| n.to_str());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let is_spy =
+            name == "paxile_spy.dll" || (name.starts_with("paxile_spy-") && name.ends_with(".dll"));
+        let is_keep = keep_name.is_some_and(|k| k.eq_ignore_ascii_case(name));
+        if is_spy && !is_keep {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 impl Spy {
     pub fn start(
         pids: Vec<u32>,
@@ -80,6 +104,7 @@ impl Spy {
                 exe.display()
             )
         })?;
+        cleanup_other_spy_dlls(dir, &dll);
         let wide: Vec<u16> = dll.as_os_str().encode_wide_nul();
         unsafe {
             let hmod =

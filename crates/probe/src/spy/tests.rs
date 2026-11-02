@@ -479,3 +479,33 @@ fn resolve_spy_dll_prefers_versioned_then_plain_then_newest() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn cleanup_other_spy_dlls_removes_stale_but_keeps_loaded_and_unrelated() {
+    use std::fs;
+    let root = std::env::temp_dir().join(format!(
+        "paxile-spy-cleanup-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let keep = root.join("paxile_spy-0.1.2.dll");
+    let stale_plain = root.join("paxile_spy.dll");
+    let stale_ver = root.join("paxile_spy-0.1.1.dll");
+    let unrelated = root.join("paxile-probe.exe");
+    for p in [&keep, &stale_plain, &stale_ver, &unrelated] {
+        fs::write(p, b"x").unwrap();
+    }
+
+    cleanup_other_spy_dlls(&root, &keep);
+
+    assert!(keep.is_file(), "the loaded DLL must survive");
+    assert!(unrelated.is_file(), "non-spy files are untouched");
+    assert!(!stale_plain.is_file(), "the legacy plain DLL is removed");
+    assert!(!stale_ver.is_file(), "an older version DLL is removed");
+
+    fs::remove_dir_all(&root).ok();
+}
