@@ -34,21 +34,52 @@ pub struct Spy {
     stop: Arc<AtomicBool>,
 }
 
+/// Locates the spy DLL next to the probe executable.
+///
+/// Release bundles install a version-stamped name (`paxile_spy-<version>.dll`)
+/// instead of the plain `paxile_spy.dll`. An in-place update can never overwrite
+/// the plain DLL while a host application still has it mapped (and file-locked),
+/// which previously left a stale, pre-fix DLL behind; a fresh per-version name is
+/// never locked by an older version, so the new DLL always lands. Dev and test
+/// builds still produce the plain `paxile_spy.dll`. Prefer the exact version,
+/// then the plain name, then the newest version-stamped sibling as a safety net.
+fn resolve_spy_dll(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let versioned = dir.join(concat!("paxile_spy-", env!("CARGO_PKG_VERSION"), ".dll"));
+    if versioned.is_file() {
+        return Some(versioned);
+    }
+    let plain = dir.join("paxile_spy.dll");
+    if plain.is_file() {
+        return Some(plain);
+    }
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("paxile_spy-") && n.ends_with(".dll"))
+        })
+        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+}
+
 impl Spy {
     pub fn start(
         pids: Vec<u32>,
         policy: paxile_policy::Config,
         control: crate::control::Shared,
     ) -> Result<Spy, String> {
-        let dll = std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .with_file_name("paxile_spy.dll");
-        if !dll.exists() {
-            return Err(format!(
-                "{} not found (cargo build the workspace)",
-                dll.display()
-            ));
-        }
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let dir = exe
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", exe.display()))?;
+        let dll = resolve_spy_dll(dir).ok_or_else(|| {
+            format!(
+                "paxile_spy DLL not found next to {} (cargo build the workspace)",
+                exe.display()
+            )
+        })?;
         let wide: Vec<u16> = dll.as_os_str().encode_wide_nul();
         unsafe {
             let hmod =

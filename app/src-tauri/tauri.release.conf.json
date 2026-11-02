@@ -10,7 +10,7 @@
       "../../target/reconnect/debug/paxile-probe.exe": null,
       "../../target/reconnect/debug/paxile_spy.dll": null,
       "../../target/reconnect/release/paxile-probe.exe": "paxile-probe.exe",
-      "../../target/reconnect/release/paxile_spy.dll": "paxile_spy.dll"
+      "../../target/reconnect/release/paxile_spy.dll": "paxile_spy-0.1.2.dll"
     },
     "windows": {
       "nsis": {

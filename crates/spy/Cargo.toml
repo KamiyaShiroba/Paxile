@@ -1,6 +1,6 @@
 [package]
 name = "paxile-spy"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Read-only message-hook DLL: reports IME/focus/key messages of the hooked thread to paxile-probe"
 

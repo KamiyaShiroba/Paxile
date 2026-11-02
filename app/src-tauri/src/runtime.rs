@@ -120,7 +120,7 @@ mod launch;
 
 pub fn start(app: &AppHandle) -> Result<Child, String> {
     let probe = crate::probe_path(app).ok_or("找不到匹配的引擎 EXE / DLL")?;
-    if !probe.with_file_name("paxile_spy.dll").is_file() {
+    if !crate::spy_dll_beside(&probe) {
         return Err("缺少 paxile_spy.dll".into());
     }
     let config = crate::config::config_path(app)?;

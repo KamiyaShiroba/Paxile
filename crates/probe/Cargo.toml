@@ -1,6 +1,6 @@
 [package]
 name = "paxile-probe"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Read-only observer of window/focus/caret/IME events for a target process"
 

@@ -445,3 +445,37 @@ fn duplex_pipe_transports_config_lease_and_stop() {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
+
+#[test]
+fn resolve_spy_dll_prefers_versioned_then_plain_then_newest() {
+    use std::fs;
+    let root = std::env::temp_dir().join(format!(
+        "paxile-spy-resolve-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let exact = root.join(concat!("paxile_spy-", env!("CARGO_PKG_VERSION"), ".dll"));
+    let plain = root.join("paxile_spy.dll");
+    let other = root.join("paxile_spy-9.9.9.dll");
+
+    // Nothing installed yet.
+    assert!(resolve_spy_dll(&root).is_none());
+
+    // A version-stamped sibling that is not this build is still usable as a net.
+    fs::write(&other, b"x").unwrap();
+    assert_eq!(resolve_spy_dll(&root).as_deref(), Some(other.as_path()));
+
+    // The dev/test plain name is preferred over an unrelated version.
+    fs::write(&plain, b"x").unwrap();
+    assert_eq!(resolve_spy_dll(&root).as_deref(), Some(plain.as_path()));
+
+    // The exact version for this build wins over everything.
+    fs::write(&exact, b"x").unwrap();
+    assert_eq!(resolve_spy_dll(&root).as_deref(), Some(exact.as_path()));
+
+    fs::remove_dir_all(&root).ok();
+}

@@ -200,6 +200,28 @@ fn should_start_silently(_autostart: bool, preference: bool) -> bool {
     preference
 }
 
+/// True when a spy DLL sits next to `probe`: either the dev/test `paxile_spy.dll`
+/// or a release's version-stamped `paxile_spy-<version>.dll`. Release bundles use
+/// the versioned name so an in-place update lands even while the old DLL is locked
+/// inside a host app, so the preflight must accept either form.
+pub(crate) fn spy_dll_beside(probe: &std::path::Path) -> bool {
+    let Some(dir) = probe.parent() else {
+        return false;
+    };
+    if dir.join("paxile_spy.dll").is_file() {
+        return true;
+    }
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("paxile_spy-") && n.ends_with(".dll"))
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn probe_path(app: &AppHandle) -> Option<PathBuf> {
     if let Ok(resource_dir) = app.path().resource_dir() {
         for bundled in [
@@ -207,7 +229,7 @@ fn probe_path(app: &AppHandle) -> Option<PathBuf> {
             resource_dir.join("target/runtime-control/debug/paxile-probe.exe"),
             resource_dir.join("target/reconnect/debug/paxile-probe.exe"),
         ] {
-            if bundled.is_file() && bundled.with_file_name("paxile_spy.dll").is_file() {
+            if bundled.is_file() && spy_dll_beside(&bundled) {
                 return Some(bundled);
             }
         }
@@ -220,7 +242,7 @@ fn probe_path(app: &AppHandle) -> Option<PathBuf> {
             dir.join("target/reconnect/debug/paxile-probe.exe"),
             dir.join("target/debug/paxile-probe.exe"),
         ] {
-            if candidate.is_file() && candidate.with_file_name("paxile_spy.dll").is_file() {
+            if candidate.is_file() && spy_dll_beside(&candidate) {
                 return Some(candidate);
             }
         }
