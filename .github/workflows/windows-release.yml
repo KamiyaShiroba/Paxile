@@ -75,6 +75,32 @@ jobs:
           updaterJsonPreferNsis: true
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
+      - name: Normalize updater manifest to the public download URL
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          # tauri-action sometimes writes an api.github.com/.../releases/assets/<id>
+          # URL into latest.json. The installed app only trusts the public
+          # github.com/.../releases/download/ form, so rewrite it before clients
+          # fetch the manifest. The signature covers the installer bytes, not the
+          # URL, so it stays valid.
+          $tag = '${{ github.ref_name }}'
+          $dir = Join-Path $env:RUNNER_TEMP 'paxile-manifest-normalize'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          gh release download $tag --dir $dir --pattern 'latest.json' --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'latest.json download failed' }
+          $installer = gh release view $tag --json assets --jq '.assets[] | select(.name | endswith("x64-setup.exe")) | .url'
+          if (-not $installer) { throw 'Installer browser-download URL not found' }
+          $file = Join-Path $dir 'latest.json'
+          $raw = Get-Content $file -Raw
+          $raw = [regex]::Replace($raw, 'https://api\.github\.com/repos/KamiyaShiroba/Paxile/releases/assets/\d+', $installer.Trim())
+          if ($raw -match 'api\.github\.com') { throw 'Manifest still references api.github.com after rewrite' }
+          [System.IO.File]::WriteAllText($file, $raw, (New-Object System.Text.UTF8Encoding($false)))
+          gh release upload $tag $file --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'latest.json re-upload failed' }
       - name: Verify published manifest and installer signatures
         shell: pwsh
         env:
