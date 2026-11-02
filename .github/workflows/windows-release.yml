@@ -37,6 +37,7 @@ jobs:
           npm ci
           npm test
           npm run build
+          npm install --global @tauri-apps/cli@2.12.4
       - name: Build matching debug core for Tauri resources
         run: cargo build --workspace --locked --target-dir target/reconnect
       - name: Tauri format, clippy and tests
@@ -56,8 +57,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
         with:
           projectPath: app
-          tauriScript: npm exec --yes --package @tauri-apps/cli@2.12.4 -- tauri
-          args: --config src-tauri/tauri.release.conf.json --bundles nsis
+          tauriScript: tauri
+          args: --config src-tauri/tauri.release.conf.json
           tagName: ${{ github.ref_name }}
           releaseName: Paxile ${{ github.ref_name }}
           generateReleaseNotes: true
